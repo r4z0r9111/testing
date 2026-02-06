@@ -3,10 +3,7 @@
     User Offboarding Compliance Checklist Auditor
 .DESCRIPTION
     Performs a comprehensive audit of user offboarding status using Microsoft Graph API.
-    Requires Microsoft Graph PowerShell SDK modules.
-.NOTES
-    Compatible with: Windows PowerShell 5.1, PowerShell 7.x
-    Required Modules: Microsoft.Graph.Users, Microsoft.Graph.Groups, Microsoft.Graph.Identity.SignIns
+    Handles permission errors and provides guidance on required roles.
 #>
 
 #region Prerequisites Check
@@ -18,28 +15,14 @@ $requiredModules = @(
     "Microsoft.Graph.Identity.SignIns"
 )
 
-$missingModules = @()
 foreach ($module in $requiredModules) {
     if (-not (Get-Module -ListAvailable -Name $module)) {
-        $missingModules += $module
+        Write-Host "ERROR: Missing module $module" -ForegroundColor Red
+        Write-Host "Install with: Install-Module Microsoft.Graph -Scope CurrentUser -Force" -ForegroundColor Yellow
+        exit 1
     }
+    Import-Module $module -ErrorAction Stop
 }
-
-if ($missingModules.Count -gt 0) {
-    Write-Host "MISSING REQUIRED MODULES:" -ForegroundColor Red
-    foreach ($mod in $missingModules) {
-        Write-Host "  - $mod" -ForegroundColor Yellow
-    }
-    Write-Host ""
-    Write-Host "Install required modules with:" -ForegroundColor Cyan
-    Write-Host "Install-Module Microsoft.Graph -Scope CurrentUser -Force" -ForegroundColor White
-    exit 1
-}
-
-Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
-Import-Module Microsoft.Graph.Users -ErrorAction Stop
-Import-Module Microsoft.Graph.Groups -ErrorAction Stop
-Import-Module Microsoft.Graph.Identity.SignIns -ErrorAction Stop
 
 #endregion
 
@@ -99,7 +82,7 @@ function Write-CheckItem {
     param(
         [string]$Category,
         [string]$Item,
-        [ValidateSet("PASS", "FAIL", "WARNING", "INFO", "MANUAL")]
+        [ValidateSet("PASS", "FAIL", "WARNING", "INFO", "MANUAL", "ERROR")]
         [string]$Status,
         [string]$Details = "",
         [string]$Recommendation = ""
@@ -111,6 +94,7 @@ function Write-CheckItem {
         "WARNING" { "[WARN] " }
         "INFO" { "[INFO] " }
         "MANUAL" { "[MANUAL] " }
+        "ERROR" { "[ERROR] " }
     }
     
     $color = switch ($Status) {
@@ -119,6 +103,7 @@ function Write-CheckItem {
         "WARNING" { "Yellow" }
         "INFO" { "White" }
         "MANUAL" { "Cyan" }
+        "ERROR" { "Red" }
     }
     
     Write-Host "  $icon" -NoNewline
@@ -135,6 +120,44 @@ function Write-CheckItem {
     
     if ($Recommendation) {
         Write-Host "      Recommendation: $Recommendation" -ForegroundColor DarkYellow
+    }
+}
+
+function Test-GraphPermissions {
+    try {
+        # Test basic read access
+        $testUser = Get-MgUser -Top 1 -ErrorAction Stop
+        Write-Host "Graph API access verified." -ForegroundColor Green
+        return $true
+    }
+    catch {
+        $errorMsg = $_.Exception.Message
+        
+        if ($errorMsg -like "*Authorization_RequestDenied*" -or 
+            $errorMsg -like "*unauthorized*" -or
+            $errorMsg -like "*Insufficient privileges*") {
+            
+            Write-Host ""
+            Write-Host "PERMISSION ERROR: Your account lacks required permissions." -ForegroundColor Red
+            Write-Host ""
+            Write-Host "Required Azure AD Role: Global Reader or Global Administrator" -ForegroundColor Yellow
+            Write-Host "OR delegated permissions with admin consent:" -ForegroundColor Yellow
+            Write-Host "  - User.Read.All" -ForegroundColor Gray
+            Write-Host "  - Group.Read.All" -ForegroundColor Gray
+            Write-Host "  - Directory.Read.All" -ForegroundColor Gray
+            Write-Host "  - AuditLog.Read.All" -ForegroundColor Gray
+            Write-Host "  - Application.Read.All" -ForegroundColor Gray
+            Write-Host ""
+            Write-Host "To fix this:" -ForegroundColor Cyan
+            Write-Host "1. Ensure you have Global Reader role in Azure AD" -ForegroundColor White
+            Write-Host "2. Or run Connect-MgGraph with -TenantId and ensure admin consent" -ForegroundColor White
+            Write-Host "3. Check that your organization allows Graph API access" -ForegroundColor White
+            Write-Host ""
+            return $false
+        }
+        
+        Write-Host "Graph API Error: $errorMsg" -ForegroundColor Red
+        return $false
     }
 }
 
@@ -212,8 +235,15 @@ function Test-LicenseStatus {
         }
     }
     catch {
-        $checks += @{Category="License"; Item="Check"; Status="WARNING"; Details="Error retrieving licenses"; Risk="MEDIUM"}
-        Write-CheckItem -Category "License" -Item "Check" -Status "WARNING" -Details "Unable to retrieve"
+        $errorMsg = $_.Exception.Message
+        if ($errorMsg -like "*Authorization_RequestDenied*") {
+            $checks += @{Category="License"; Item="Check"; Status="ERROR"; Details="Permission denied"; Risk="MEDIUM"}
+            Write-CheckItem -Category "License" -Item "Check" -Status "ERROR" -Details "Insufficient permissions to read licenses" -Recommendation "Requires User.Read.All permission"
+        }
+        else {
+            $checks += @{Category="License"; Item="Check"; Status="WARNING"; Details="Error retrieving licenses"; Risk="MEDIUM"}
+            Write-CheckItem -Category "License" -Item "Check" -Status "WARNING" -Details "Unable to retrieve"
+        }
     }
     
     return $checks, $findings
@@ -283,8 +313,15 @@ function Test-GroupMemberships {
         }
     }
     catch {
-        $checks += @{Category="Groups"; Item="Check"; Status="WARNING"; Details="Error retrieving groups: $($_.Exception.Message)"; Risk="MEDIUM"}
-        Write-CheckItem -Category "Groups" -Item "Check" -Status "WARNING" -Details "Unable to retrieve"
+        $errorMsg = $_.Exception.Message
+        if ($errorMsg -like "*Authorization_RequestDenied*") {
+            $checks += @{Category="Groups"; Item="Check"; Status="ERROR"; Details="Permission denied"; Risk="MEDIUM"}
+            Write-CheckItem -Category "Groups" -Item "Check" -Status "ERROR" -Details "Insufficient permissions to read groups" -Recommendation "Requires Group.Read.All permission"
+        }
+        else {
+            $checks += @{Category="Groups"; Item="Check"; Status="WARNING"; Details="Error retrieving groups"; Risk="MEDIUM"}
+            Write-CheckItem -Category "Groups" -Item "Check" -Status "WARNING" -Details "Unable to retrieve"
+        }
     }
     
     return $checks, $findings
@@ -343,8 +380,15 @@ function Test-ApplicationAccess {
         }
     }
     catch {
-        $checks += @{Category="Apps"; Item="Check"; Status="WARNING"; Details="Error retrieving apps: $($_.Exception.Message)"; Risk="MEDIUM"}
-        Write-CheckItem -Category "Apps" -Item="Check" -Status "WARNING" -Details="Unable to retrieve"
+        $errorMsg = $_.Exception.Message
+        if ($errorMsg -like "*Authorization_RequestDenied*") {
+            $checks += @{Category="Apps"; Item="Check"; Status="ERROR"; Details="Permission denied"; Risk="MEDIUM"}
+            Write-CheckItem -Category "Apps" -Item="Check" -Status "ERROR" -Details="Requires Application.Read.All permission" -Recommendation="Grant permission or check as Global Admin"
+        }
+        else {
+            $checks += @{Category="Apps"; Item="Check"; Status="WARNING"; Details="Error retrieving apps"; Risk="MEDIUM"}
+            Write-CheckItem -Category "Apps" -Item="Check" -Status "WARNING" -Details="Unable to retrieve"
+        }
     }
     
     $checks += @{Category="Apps"; Item="OAuth Consents"; Status="MANUAL"; Details="Verify in Azure AD"; Risk="MEDIUM"}
@@ -375,315 +419,12 @@ function Test-DeviceAccess {
         }
     }
     catch {
-        $checks += @{Category="Devices"; Item="Check"; Status="WARNING"; Details="Error retrieving devices: $($_.Exception.Message)"; Risk="MEDIUM"}
-        Write-CheckItem -Category "Devices" -Item="Check" -Status "WARNING" -Details="Unable to retrieve"
-    }
-    
-    $checks += @{Category="Devices"; Item="BitLocker Keys"; Status="MANUAL"; Details="Backup recovery keys"; Risk="HIGH"}
-    Write-CheckItem -Category "Devices" -Item="BitLocker Keys" -Status "MANUAL" -Details="Export keys" -Recommendation="Backup BitLocker keys before wipe"
-    
-    return $checks, $findings
-}
-
-function Test-DataGovernance {
-    $checks = @()
-    
-    Write-SectionHeader "8. DATA GOVERNANCE"
-    
-    $checks += @{Category="Data"; Item="OneDrive Files"; Status="MANUAL"; Details="Transfer or archive"; Risk="HIGH"}
-    Write-CheckItem -Category "Data" -Item="OneDrive Files" -Status "MANUAL" -Details="Handle user data" -Recommendation="Grant manager access for 30 days"
-    
-    $checks += @{Category="Data"; Item="SharePoint Sites"; Status="MANUAL"; Details="Transfer ownership"; Risk="HIGH"}
-    Write-CheckItem -Category "Data" -Item="SharePoint Sites" -Status "MANUAL" -Details="Check site ownership" -Recommendation="Reassign site ownership"
-    
-    $checks += @{Category="Data"; Item="eDiscovery Hold"; Status="MANUAL"; Details="Check legal holds"; Risk="CRITICAL"}
-    Write-CheckItem -Category "Data" -Item="eDiscovery Hold" -Status "MANUAL" -Details="Verify hold status" -Recommendation="Place on legal hold if required"
-    
-    return $checks, @()
-}
-
-#endregion
-
-#region Report Generation
-
-function Show-SummaryReport {
-    param(
-        [array]$AllChecks,
-        [array]$AllFindings,
-        [object]$User
-    )
-    
-    $passCount = ($AllChecks | Where-Object { $_.Status -eq "PASS" }).Count
-    $failCount = ($AllChecks | Where-Object { $_.Status -eq "FAIL" }).Count
-    $warnCount = ($AllChecks | Where-Object { $_.Status -eq "WARNING" }).Count
-    $manualCount = ($AllChecks | Where-Object { $_.Status -eq "MANUAL" }).Count
-    $total = $AllChecks.Count
-    
-    $score = 0
-    if ($total -gt 0) { 
-        $score = [math]::Round(($passCount / $total) * 100) 
-    }
-    
-    $criticalCount = ($AllFindings | Where-Object { $_.Risk -eq "CRITICAL" }).Count
-    $highCount = ($AllFindings | Where-Object { $_.Risk -eq "HIGH" }).Count
-    
-    $riskLevel = "LOW"
-    if ($criticalCount -gt 0) { $riskLevel = "CRITICAL" }
-    elseif ($highCount -gt 0) { $riskLevel = "HIGH" }
-    elseif ($warnCount -gt 0) { $riskLevel = "MEDIUM" }
-    
-    $riskColor = "Green"
-    if ($riskLevel -eq "CRITICAL") { $riskColor = "Magenta" }
-    elseif ($riskLevel -eq "HIGH") { $riskColor = "Red" }
-    elseif ($riskLevel -eq "MEDIUM") { $riskColor = "Yellow" }
-    
-    Write-Host ""
-    Write-Host "===============================================================" -ForegroundColor $riskColor
-    Write-Host "                 OFFBOARDING AUDIT SUMMARY" -ForegroundColor $riskColor
-    Write-Host "===============================================================" -ForegroundColor $riskColor
-    Write-Host ""
-    
-    Write-Host "User: $($User.DisplayName)" -ForegroundColor White
-    Write-Host "Email: $($User.Mail)" -ForegroundColor White
-    Write-Host ""
-    
-    Write-Host "Risk Level: $riskLevel" -ForegroundColor $riskColor
-    Write-Host "Compliance Score: $score%" -ForegroundColor White
-    Write-Host ""
-    
-    Write-Host "Results Summary:" -ForegroundColor White
-    Write-Host "  Passed:  $passCount" -ForegroundColor Green
-    Write-Host "  Failed:  $failCount" -ForegroundColor Red
-    Write-Host "  Warnings: $warnCount" -ForegroundColor Yellow
-    Write-Host "  Manual:  $manualCount" -ForegroundColor Cyan
-    Write-Host ""
-    
-    if ($AllFindings.Count -gt 0) {
-        Write-Host "---------------------------------------------------------------" -ForegroundColor Red
-        Write-Host " CRITICAL FINDINGS" -ForegroundColor Red
-        Write-Host "---------------------------------------------------------------" -ForegroundColor Red
-        
-        $critical = $AllFindings | Where-Object { $_.Risk -eq "CRITICAL" }
-        $high = $AllFindings | Where-Object { $_.Risk -eq "HIGH" }
-        
-        if ($critical.Count -gt 0) {
-            Write-Host ""
-            Write-Host "CRITICAL (Immediate Action):" -ForegroundColor Magenta
-            foreach ($f in $critical) {
-                Write-Host "  Issue: $($f.Issue)" -ForegroundColor Magenta
-                Write-Host "  Action: $($f.Action)" -ForegroundColor White
-                Write-Host ""
-            }
+        $errorMsg = $_.Exception.Message
+        if ($errorMsg -like "*Authorization_RequestDenied*") {
+            $checks += @{Category="Devices"; Item="Check"; Status="ERROR"; Details="Permission denied"; Risk="MEDIUM"}
+            Write-CheckItem -Category "Devices" -Item="Check" -Status "ERROR" -Details="Requires Device.Read.All permission" -Recommendation="Grant permission or check manually in Endpoint Manager"
         }
-        
-        if ($high.Count -gt 0) {
-            Write-Host "HIGH PRIORITY:" -ForegroundColor Red
-            foreach ($f in $high) {
-                Write-Host "  Issue: $($f.Issue)" -ForegroundColor Red
-                Write-Host "  Action: $($f.Action)" -ForegroundColor White
-                Write-Host ""
-            }
+        else {
+            $checks += @{Category="Devices"; Item="Check"; Status="WARNING"; Details="Error retrieving devices"; Risk="MEDIUM"}
+            Write-CheckItem -Category "Devices" -Item="Check" -Status "WARNING" -Details="Unable to retrieve"
         }
-    }
-    else {
-        Write-Host "No critical findings detected." -ForegroundColor Green
-    }
-    
-    Write-Host "---------------------------------------------------------------" -ForegroundColor Cyan
-    Write-Host " MANUAL VERIFICATION CHECKLIST" -ForegroundColor Cyan
-    Write-Host "---------------------------------------------------------------"
-    
-    $manualChecks = $AllChecks | Where-Object { $_.Status -eq "MANUAL" }
-    foreach ($check in $manualChecks) {
-        Write-Host "  [ ] $($check.Category): $($check.Item)" -ForegroundColor Cyan
-        if ($check.Recommendation) {
-            Write-Host "      $($check.Recommendation)" -ForegroundColor Gray
-        }
-    }
-    
-    # Export report
-    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $safeName = $User.UserPrincipalName -replace "@", "_" -replace "\.", "_"
-    
-    $report = @{
-        AuditDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-        User = @{
-            Name = $User.DisplayName
-            Email = $User.Mail
-            UPN = $User.UserPrincipalName
-        }
-        Summary = @{
-            RiskLevel = $riskLevel
-            Score = $score
-            Passed = $passCount
-            Failed = $failCount
-            Warnings = $warnCount
-            Manual = $manualCount
-        }
-        Findings = $AllFindings
-        Checks = $AllChecks
-    }
-    
-    try {
-        $jsonPath = ".\OffboardingAudit_${safeName}_$timestamp.json"
-        $report | ConvertTo-Json -Depth 5 | Out-File -FilePath $jsonPath -ErrorAction Stop
-        Write-Host ""
-        Write-Host "JSON report saved: $jsonPath" -ForegroundColor Green
-    }
-    catch {
-        Write-Host "Warning: Could not save JSON report: $($_.Exception.Message)" -ForegroundColor Yellow
-    }
-    
-    try {
-        $csvPath = ".\OffboardingAudit_${safeName}_$timestamp.csv"
-        $AllChecks | Export-Csv -Path $csvPath -NoTypeInformation -ErrorAction Stop
-        Write-Host "CSV report saved: $csvPath" -ForegroundColor Green
-    }
-    catch {
-        Write-Host "Warning: Could not save CSV report: $($_.Exception.Message)" -ForegroundColor Yellow
-    }
-}
-
-#endregion
-
-#region Main Execution
-
-try {
-    Show-Banner
-    
-    # Check PowerShell version
-    $psVersion = $PSVersionTable.PSVersion
-    Write-Host "PowerShell Version: $($psVersion.Major).$($psVersion.Minor)" -ForegroundColor Gray
-    Write-Host ""
-    
-    # Connect to Graph
-    $context = Get-MgContext
-    if (-not $context) {
-        Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Yellow
-        
-        $scopes = @(
-            "User.Read.All",
-            "Group.Read.All",
-            "Directory.Read.All",
-            "AuditLog.Read.All",
-            "Application.Read.All"
-        )
-        
-        try {
-            Connect-MgGraph -Scopes $scopes -ErrorAction Stop
-            $context = Get-MgContext
-        }
-        catch {
-            Write-Host "Failed to connect to Microsoft Graph: $($_.Exception.Message)" -ForegroundColor Red
-            Write-Host "Ensure you have proper permissions and consent." -ForegroundColor Yellow
-            exit 1
-        }
-    }
-    
-    Write-Host "Connected as: $($context.Account)" -ForegroundColor Green
-    Write-Host ""
-    
-    # Get user email
-    $email = Read-EmailInput -PromptMessage "Enter email of user to audit: "
-    
-    Write-Host ""
-    Write-Host "Retrieving user information..." -ForegroundColor Yellow
-    
-    # Get user with required properties
-    $userFilter = "mail eq '$email' or userPrincipalName eq '$email'"
-    $selectProperties = @(
-        "id",
-        "displayName",
-        "mail",
-        "userPrincipalName",
-        "accountEnabled",
-        "department",
-        "signInActivity"
-    )
-    
-    try {
-        $user = Get-MgUser -Filter $userFilter -Property $selectProperties -ErrorAction Stop | Select-Object -First 1
-    }
-    catch {
-        Write-Host "Error retrieving user: $($_.Exception.Message)" -ForegroundColor Red
-        exit 1
-    }
-    
-    if (-not $user) {
-        Write-Host "User not found: $email" -ForegroundColor Red
-        exit 1
-    }
-    
-    Write-Host "Found: $($user.DisplayName)" -ForegroundColor Green
-    Write-Host "Department: $($user.Department)" -ForegroundColor Gray
-    Write-Host ""
-    
-    # Confirm audit
-    $confirm = Read-Host "Proceed with audit? (yes/no)"
-    if ($confirm -ne "yes") {
-        Write-Host "Audit cancelled." -ForegroundColor Yellow
-        exit 0
-    }
-    
-    Write-Host ""
-    Write-Host "Running compliance checks..." -ForegroundColor Green
-    Write-Host ""
-    
-    # Run all checks
-    $allChecks = @()
-    $allFindings = @()
-    
-    # Check 1: Account Status
-    $c, $f = Test-UserAccountStatus -User $user
-    $allChecks += $c
-    $allFindings += $f
-    
-    # Check 2: License Status
-    $c, $f = Test-LicenseStatus -UserId $user.Id
-    $allChecks += $c
-    $allFindings += $f
-    
-    # Check 3: Group Memberships
-    $c, $f = Test-GroupMemberships -UserId $user.Id
-    $allChecks += $c
-    $allFindings += $f
-    
-    # Check 4: Mailbox Status
-    $c, $f = Test-MailboxStatus
-    $allChecks += $c
-    $allFindings += $f
-    
-    # Check 5: Teams Status
-    $c, $f = Test-TeamsStatus
-    $allChecks += $c
-    $allFindings += $f
-    
-    # Check 6: Application Access
-    $c, $f = Test-ApplicationAccess -UserId $user.Id
-    $allChecks += $c
-    $allFindings += $f
-    
-    # Check 7: Device Access
-    $c, $f = Test-DeviceAccess -UserId $user.Id
-    $allChecks += $c
-    $allFindings += $f
-    
-    # Check 8: Data Governance
-    $c, $f = Test-DataGovernance
-    $allChecks += $c
-    $allFindings += $f
-    
-    # Show report
-    Show-SummaryReport -AllChecks $allChecks -AllFindings $allFindings -User $user
-    
-    Write-Host ""
-    Write-Host "Audit complete!" -ForegroundColor Green
-}
-catch {
-    Write-Host ""
-    Write-Host "CRITICAL ERROR: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host $_.ScriptStackTrace -ForegroundColor DarkRed
-    exit 1
-}
-
-#endregion
