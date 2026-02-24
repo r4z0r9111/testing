@@ -5,19 +5,25 @@
     Scans Finance department and analyzes specified groups/DLs for active/offboarded users
 .PARAMETER DepartmentName
     Department to scan (default: Finance)
+.PARAMETER GroupNames
+    Array of group display names to analyze
 .PARAMETER GroupIds
     Array of group object IDs to analyze
 .PARAMETER ExportPath
     Path for output files
+.PARAMETER IncludeSignInActivity
+    Include last sign-in data (requires AuditLog.Read.All)
 .PARAMETER InactivityThresholdDays
-    Number of days without sign-in to consider inactive (default: 90)
+    Days without sign-in to consider inactive (default: 90)
 #>
 
 [CmdletBinding()]
 param(
     [string]$DepartmentName = "Finance",
+    [string[]]$GroupNames = @(),
     [string[]]$GroupIds = @(),
     [string]$ExportPath = ".\FinanceCensus_$(Get-Date -Format 'yyyyMMdd_HHmmss')",
+    [switch]$IncludeSignInActivity,
     [int]$InactivityThresholdDays = 90
 )
 
@@ -26,9 +32,12 @@ param(
 function Connect-GraphEnvironment {
     $scopes = @(
         "User.Read.All",
-        "Directory.Read.All",
-        "AuditLog.Read.All"
+        "Directory.Read.All"
     )
+    
+    if ($IncludeSignInActivity) {
+        $scopes += "AuditLog.Read.All"
+    }
     
     Connect-MgGraph -Scopes $scopes -NoWelcome
     Write-Host "Connected to Microsoft Graph" -ForegroundColor Green
@@ -46,46 +55,49 @@ function Get-FinanceUsers {
         'Department',
         'AccountEnabled',
         'CreatedDateTime',
-        'OfficeLocation',
-        'SignInActivity'
+        'OfficeLocation'
     )
     
+    if ($IncludeSignInActivity) {
+        $properties += 'SignInActivity'
+    }
+    
     $filter = "department eq '$DepartmentName'"
-    $users = Get-MgUser -Filter $filter -Property $properties -All -ConsistencyLevel eventual
+    $users = Get-MgUser -Filter $filter -Property $properties -All
     
     $results = foreach ($user in $users) {
         $isActive = $user.AccountEnabled
         $status = if ($isActive) { "Active" } else { "Offboarded" }
         
-        # Get last sign-in info
         $lastSignIn = $null
         $daysSinceSignIn = $null
         $signInStatus = "Unknown"
+        $offboardingReason = "N/A"
         
-        if ($user.SignInActivity.LastSignInDateTime) {
+        if ($IncludeSignInActivity -and $user.SignInActivity.LastSignInDateTime) {
             $lastSignIn = [datetime]$user.SignInActivity.LastSignInDateTime
             $daysSinceSignIn = ((Get-Date) - $lastSignIn).Days
             
             if ($daysSinceSignIn -gt $InactivityThresholdDays) {
                 $signInStatus = "Inactive ($daysSinceSignIn days)"
+                if ($isActive) {
+                    $status = "Offboarded (Inactive)"
+                    $offboardingReason = "No sign-in for $daysSinceSignIn days"
+                }
             }
             else {
-                $signInStatus = "Active ($daysSinceSignIn days ago)"
+                $signInStatus = "Active (last sign-in $daysSinceSignIn days ago)"
             }
         }
         else {
-            $signInStatus = "Never signed in"
-            $daysSinceSignIn = 999999
+            $signInStatus = "No sign-in data"
+            if ($isActive) {
+                $offboardingReason = "Account enabled but no recent sign-in data"
+            }
         }
         
-        # Determine offboarding reason
-        $offboardingReason = "N/A"
         if (-not $isActive) {
-            $offboardingReason = "Account Disabled"
-        }
-        elseif ($daysSinceSignIn -gt $InactivityThresholdDays) {
-            $offboardingReason = "Inactive for $daysSinceSignIn days"
-            $status = "Offboarded (Inactive)"
+            $offboardingReason = "Account disabled in Azure AD"
         }
         
         [PSCustomObject]@{
@@ -97,9 +109,8 @@ function Get-FinanceUsers {
             Department = $user.Department
             Status = $status
             IsActive = $isActive
-            AccountEnabled = $user.AccountEnabled
             OffboardingReason = $offboardingReason
-            LastSignInDateTime = $lastSignIn
+            LastSignInDate = $lastSignIn
             DaysSinceLastSignIn = $daysSinceSignIn
             SignInStatus = $signInStatus
             CreatedDate = $user.CreatedDateTime
@@ -145,8 +156,8 @@ function Get-GroupAnalysis {
                 }
             }
             
-            $active = $groupFinanceUsers | Where-Object { $_.IsActive -and $_.DaysSinceLastSignIn -le $InactivityThresholdDays }
-            $offboarded = $groupFinanceUsers | Where-Object { -not $_.IsActive -or $_.DaysSinceLastSignIn -gt $InactivityThresholdDays }
+            $active = $groupFinanceUsers | Where-Object { $_.IsActive -and ($_.DaysSinceLastSignIn -lt $InactivityThresholdDays -or $_.DaysSinceLastSignIn -eq $null) }
+            $offboarded = $groupFinanceUsers | Where-Object { -not $_.IsActive -or $_.DaysSinceLastSignIn -ge $InactivityThresholdDays }
             
             $result = [PSCustomObject]@{
                 GroupId = $group.Id
@@ -182,79 +193,32 @@ function Export-Results {
     
     New-Item -ItemType Directory -Path $ExportPath -Force | Out-Null
     
-    # Common properties for all reports
-    $commonProps = @(
-        'DisplayName',
-        'UserPrincipalName',
-        'Email',
-        'Department',
-        'JobTitle',
-        'Status',
-        'OffboardingReason',
-        'LastSignInDateTime',
-        'DaysSinceLastSignIn',
-        'SignInStatus',
-        'AccountEnabled',
-        'CreatedDate',
-        'OfficeLocation'
-    )
-    
-    # All users with full details
     $allPath = Join-Path $ExportPath "All_Finance_Users.csv"
-    $AllUsers | Select-Object ($commonProps + @{N='GroupMemberships';E={$_.Groups -join ';'}}) | Export-Csv -Path $allPath -NoTypeInformation
+    $AllUsers | Select-Object Id, DisplayName, UserPrincipalName, Email, Department, JobTitle, Status, OffboardingReason, IsActive, LastSignInDate, DaysSinceLastSignIn, SignInStatus, CreatedDate, OfficeLocation, @{N='Groups';E={$_.Groups -join ';'}} | Export-Csv -Path $allPath -NoTypeInformation
     
-    # Active only
     $activePath = Join-Path $ExportPath "Active_Users.csv"
-    $AllUsers | Where-Object { $_.Status -eq "Active" } | Select-Object $commonProps | Export-Csv -Path $activePath -NoTypeInformation
+    $AllUsers | Where-Object { $_.Status -eq "Active" } | Select-Object DisplayName, UserPrincipalName, Email, Department, JobTitle, LastSignInDate, DaysSinceLastSignIn, SignInStatus, OfficeLocation | Export-Csv -Path $activePath -NoTypeInformation
     
-    # Offboarded only with reasons
     $offPath = Join-Path $ExportPath "Offboarded_Users.csv"
-    $AllUsers | Where-Object { $_.Status -ne "Active" } | Select-Object $commonProps | Export-Csv -Path $offPath -NoTypeInformation
+    $AllUsers | Where-Object { $_.Status -ne "Active" } | Select-Object DisplayName, UserPrincipalName, Email, Department, JobTitle, Status, OffboardingReason, LastSignInDate, DaysSinceLastSignIn, IsActive, OfficeLocation | Export-Csv -Path $offPath -NoTypeInformation
     
-    # Group details
     foreach ($group in $GroupResults) {
         $safeName = $group.GroupName -replace '[\\/:*?"<>|]', '_'
         
         if ($group.ActiveUsers.Count -gt 0) {
-            $group.ActiveUsers | Select-Object $commonProps | Export-Csv -Path (Join-Path $ExportPath "$safeName`_Active.csv") -NoTypeInformation
+            $group.ActiveUsers | Select-Object DisplayName, UserPrincipalName, Email, Department, JobTitle, LastSignInDate, DaysSinceLastSignIn, SignInStatus | Export-Csv -Path (Join-Path $ExportPath "$safeName`_Active.csv") -NoTypeInformation
         }
         
         if ($group.OffboardedUsers.Count -gt 0) {
-            $group.OffboardedUsers | Select-Object $commonProps | Export-Csv -Path (Join-Path $ExportPath "$safeName`_Offboarded_RISK.csv") -NoTypeInformation
+            $group.OffboardedUsers | Select-Object DisplayName, UserPrincipalName, Email, Department, JobTitle, Status, OffboardingReason, LastSignInDate, DaysSinceLastSignIn, IsActive | Export-Csv -Path (Join-Path $ExportPath "$safeName`_Offboarded_RISK.csv") -NoTypeInformation
         }
     }
     
-    # Security report - offboarded users still in groups
     $risks = $AllUsers | Where-Object { $_.Status -ne "Active" -and $_.Groups.Count -gt 0 }
     if ($risks.Count -gt 0) {
         $riskPath = Join-Path $ExportPath "SECURITY_RISK_Offboarded_In_Groups.csv"
-        $risks | Select-Object ($commonProps + @{N='GroupMemberships';E={$_.Groups -join ';'}}) | Export-Csv -Path $riskPath -NoTypeInformation
+        $risks | Select-Object DisplayName, UserPrincipalName, Email, Department, JobTitle, Status, OffboardingReason, LastSignInDate, DaysSinceLastSignIn, @{N='GroupMemberships';E={$_.Groups -join ';'}} | Export-Csv -Path $riskPath -NoTypeInformation
     }
-    
-    # Summary report
-    $summaryPath = Join-Path $ExportPath "Census_Summary.txt"
-    $summary = @"
-Finance Department Census Summary
-Generated: $(Get-Date)
-Department: $DepartmentName
-Inactivity Threshold: $InactivityThresholdDays days
-
-TOTAL USERS: $($AllUsers.Count)
-- Active: $(($AllUsers | Where-Object { $_.Status -eq "Active" }).Count)
-- Offboarded: $(($AllUsers | Where-Object { $_.Status -ne "Active" }).Count)
-
-OFFBOARDING BREAKDOWN:
-- Account Disabled: $(($AllUsers | Where-Object { $_.OffboardingReason -eq "Account Disabled" }).Count)
-- Inactive > $InactivityThresholdDays days: $(($AllUsers | Where-Object { $_.OffboardingReason -like "Inactive*" }).Count)
-- Never Signed In: $(($AllUsers | Where-Object { $_.SignInStatus -eq "Never signed in" }).Count)
-
-GROUPS ANALYZED: $($GroupResults.Count)
-$(foreach ($g in $GroupResults) { "- $($g.GroupName): $($g.Total) total, $($g.Offboarded) offboarded`n" })
-
-SECURITY RISKS:
-$(if ($risks.Count -gt 0) { "$($risks.Count) offboarded users still have group memberships!" } else { "None - all offboarded users removed from groups" })
-"@
-    $summary | Out-File -FilePath $summaryPath
     
     Write-Host "`nReports saved to: $ExportPath" -ForegroundColor Green
 }
@@ -286,7 +250,7 @@ Export-Results -AllUsers $financeUsers -GroupResults $analysis
 Write-Host "`nCensus Complete" -ForegroundColor Green
 Write-Host "Total Finance Users: $($financeUsers.Count)" -ForegroundColor White
 Write-Host "Active: $(($financeUsers | Where-Object { $_.Status -eq "Active" }).Count)" -ForegroundColor Green
-Write-Host "Offboarded: $(($AllUsers | Where-Object { $_.Status -ne "Active" }).Count)" -ForegroundColor Red
+Write-Host "Offboarded: $(($financeUsers | Where-Object { $_.Status -ne "Active" }).Count)" -ForegroundColor Red
 Write-Host "Groups Analyzed: $($analysis.Count)" -ForegroundColor White
 
 Disconnect-MgGraph
