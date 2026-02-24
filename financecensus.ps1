@@ -13,8 +13,6 @@
     Path for output files
 .PARAMETER IncludeSignInActivity
     Include last sign-in data (requires AuditLog.Read.All)
-.PARAMETER InactivityThresholdDays
-    Days since last sign-in to consider inactive (default: 90)
 #>
 
 [CmdletBinding()]
@@ -23,8 +21,7 @@ param(
     [string[]]$GroupNames = @(),
     [string[]]$GroupIds = @(),
     [string]$ExportPath = ".\FinanceCensus_$(Get-Date -Format 'yyyyMMdd_HHmmss')",
-    [switch]$IncludeSignInActivity,
-    [int]$InactivityThresholdDays = 90
+    [switch]$IncludeSignInActivity
 )
 
 #Requires -Modules Microsoft.Graph.Users, Microsoft.Graph.Groups
@@ -66,31 +63,15 @@ function Get-FinanceUsers {
     $users = Get-MgUser -Filter $filter -Property $properties -All
     
     $results = foreach ($user in $users) {
+        $isActive = $user.AccountEnabled
+        $status = if ($isActive) { "Active" } else { "Offboarded" }
+        
         $lastSignIn = $null
         $daysSinceSignIn = $null
-        
         if ($IncludeSignInActivity -and $user.SignInActivity.LastSignInDateTime) {
             $lastSignIn = [datetime]$user.SignInActivity.LastSignInDateTime
             $daysSinceSignIn = ((Get-Date) - $lastSignIn).Days
         }
-        
-        # Determine offboarding reason
-        $offboardingReason = "Unknown"
-        if (-not $user.AccountEnabled) {
-            $offboardingReason = "Account Disabled"
-        }
-        elseif ($lastSignIn -eq $null) {
-            $offboardingReason = "Never Signed In"
-        }
-        elseif ($daysSinceSignIn -gt $InactivityThresholdDays) {
-            $offboardingReason = "Inactive $daysSinceSignIn Days"
-        }
-        else {
-            $offboardingReason = "Active"
-        }
-        
-        $isActive = ($offboardingReason -eq "Active")
-        $status = if ($isActive) { "Active" } else { "Offboarded" }
         
         [PSCustomObject]@{
             Id = $user.Id
@@ -102,11 +83,9 @@ function Get-FinanceUsers {
             OfficeLocation = $user.OfficeLocation
             Status = $status
             IsActive = $isActive
-            AccountEnabled = $user.AccountEnabled
             CreatedDate = $user.CreatedDateTime
             LastSignInDate = $lastSignIn
             DaysSinceLastSignIn = $daysSinceSignIn
-            OffboardingReason = $offboardingReason
             Groups = @()
         }
     }
@@ -167,9 +146,6 @@ function Get-GroupAnalysis {
             
             if ($result.Offboarded -gt 0) {
                 Write-Host "  WARNING: $($result.Offboarded) offboarded users in group!" -ForegroundColor Red
-                $offboarded | ForEach-Object {
-                    Write-Host "    - $($_.DisplayName): $($_.OffboardingReason)" -ForegroundColor DarkRed
-                }
             }
         }
         catch {
@@ -188,19 +164,15 @@ function Export-Results {
     
     New-Item -ItemType Directory -Path $ExportPath -Force | Out-Null
     
-    # All users with full details including Department and Sign-in info
     $allPath = Join-Path $ExportPath "All_Finance_Users.csv"
-    $AllUsers | Select-Object Id, DisplayName, UserPrincipalName, Email, JobTitle, Department, OfficeLocation, Status, IsActive, AccountEnabled, CreatedDate, LastSignInDate, DaysSinceLastSignIn, OffboardingReason, @{N='Groups';E={$_.Groups -join ';'}} | Export-Csv -Path $allPath -NoTypeInformation
+    $AllUsers | Select-Object Id, DisplayName, UserPrincipalName, Email, JobTitle, Department, OfficeLocation, Status, IsActive, CreatedDate, LastSignInDate, DaysSinceLastSignIn, @{N='Groups';E={$_.Groups -join ';'}} | Export-Csv -Path $allPath -NoTypeInformation
     
-    # Active users
     $activePath = Join-Path $ExportPath "Active_Users.csv"
     $AllUsers | Where-Object { $_.IsActive } | Select-Object DisplayName, UserPrincipalName, Email, JobTitle, Department, LastSignInDate, DaysSinceLastSignIn | Export-Csv -Path $activePath -NoTypeInformation
     
-    # Offboarded users with reasons
     $offPath = Join-Path $ExportPath "Offboarded_Users.csv"
-    $AllUsers | Where-Object { -not $_.IsActive } | Select-Object DisplayName, UserPrincipalName, Email, JobTitle, Department, OfficeLocation, AccountEnabled, LastSignInDate, DaysSinceLastSignIn, OffboardingReason | Export-Csv -Path $offPath -NoTypeInformation
+    $AllUsers | Where-Object { -not $_.IsActive } | Select-Object DisplayName, UserPrincipalName, Email, JobTitle, Department, OfficeLocation, LastSignInDate, DaysSinceLastSignIn | Export-Csv -Path $offPath -NoTypeInformation
     
-    # Group-specific exports
     foreach ($group in $GroupResults) {
         $safeName = $group.GroupName -replace '[\\/:*?"<>|]', '_'
         
@@ -209,21 +181,19 @@ function Export-Results {
         }
         
         if ($group.OffboardedUsers.Count -gt 0) {
-            $group.OffboardedUsers | Select-Object DisplayName, UserPrincipalName, Email, JobTitle, Department, OfficeLocation, AccountEnabled, LastSignInDate, DaysSinceLastSignIn, OffboardingReason | Export-Csv -Path (Join-Path $ExportPath "$safeName`_Offboarded_RISK.csv") -NoTypeInformation
+            $group.OffboardedUsers | Select-Object DisplayName, UserPrincipalName, Email, JobTitle, Department, OfficeLocation, LastSignInDate, DaysSinceLastSignIn | Export-Csv -Path (Join-Path $ExportPath "$safeName`_Offboarded_RISK.csv") -NoTypeInformation
         }
     }
     
-    # Security risk: offboarded users still in groups
     $risks = $AllUsers | Where-Object { -not $_.IsActive -and $_.Groups.Count -gt 0 }
     if ($risks.Count -gt 0) {
         $riskPath = Join-Path $ExportPath "SECURITY_RISK_Offboarded_In_Groups.csv"
-        $risks | Select-Object DisplayName, UserPrincipalName, Email, JobTitle, Department, OffboardingReason, @{N='GroupMemberships';E={$_.Groups -join ';'}} | Export-Csv -Path $riskPath -NoTypeInformation
+        $risks | Select-Object DisplayName, UserPrincipalName, Email, Department, @{N='GroupMemberships';E={$_.Groups -join ';'}} | Export-Csv -Path $riskPath -NoTypeInformation
     }
     
     Write-Host "`nReports saved to: $ExportPath" -ForegroundColor Green
 }
 
-# MAIN EXECUTION - This is the part that actually runs
 Write-Host "Finance Department Census Tool" -ForegroundColor Cyan
 
 Connect-GraphEnvironment
