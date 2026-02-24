@@ -1,17 +1,6 @@
 <#
 .SYNOPSIS
     Finance Department User Census with Offboarding Metrics
-.DESCRIPTION
-    Scans Finance department and analyzes groups for active/offboarded users.
-    Offboarding criteria: Account disabled OR no sign-in for 90+ days
-.PARAMETER DepartmentName
-    Department to scan (default: Finance)
-.PARAMETER GroupIds
-    Array of group object IDs to analyze
-.PARAMETER InactivityThresholdDays
-    Days without sign-in to consider offboarded (default: 90)
-.PARAMETER ExportPath
-    Path for output files
 #>
 
 [CmdletBinding()]
@@ -36,8 +25,9 @@ function Connect-GraphEnvironment {
 }
 
 function Get-FinanceUsers {
-    Write-Host "`nScanning $DepartmentName department..." -ForegroundColor Cyan
-    Write-Host "Offboarding criteria: Account disabled OR no sign-in for $InactivityThresholdDays+ days" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "Scanning $DepartmentName department..." -ForegroundColor Cyan
+    Write-Host "Offboarding criteria: Account disabled OR no sign-in for $InactivityThresholdDays days or more" -ForegroundColor Gray
     
     $properties = @(
         'Id',
@@ -58,7 +48,6 @@ function Get-FinanceUsers {
     $users = Get-MgUser -Filter $filter -Property $properties -All
     
     $results = foreach ($user in $users) {
-        # Determine sign-in status
         $lastSignIn = $null
         $daysSinceSignIn = $null
         $signInStatus = "Unknown"
@@ -70,16 +59,15 @@ function Get-FinanceUsers {
         }
         else {
             $signInStatus = "Never"
-            $daysSinceSignIn = 9999  # Effectively never signed in
+            $daysSinceSignIn = 9999
         }
         
-        # Determine offboarding reason
         $isDisabled = -not $user.AccountEnabled
         $isInactive = $daysSinceSignIn -ge $InactivityThresholdDays
         
         $offboardReason = @()
         if ($isDisabled) { $offboardReason += "Account Disabled" }
-        if ($isInactive) { $offboardReason += "Inactive $($daysSinceSignIn) days" }
+        if ($isInactive) { $offboardReason += "Inactive $daysSinceSignIn days" }
         
         $status = if ($isDisabled -or $isInactive) { "Offboarded" } else { "Active" }
         $offboardDetails = if ($offboardReason.Count -gt 0) { $offboardReason -join "; " } else { "N/A" }
@@ -94,24 +82,16 @@ function Get-FinanceUsers {
             CompanyName = $user.CompanyName
             OfficeLocation = $user.OfficeLocation
             EmployeeType = $user.EmployeeType
-            
-            # Status details
             Status = $status
             IsActive = -not ($isDisabled -or $isInactive)
             AccountEnabled = $user.AccountEnabled
             AccountStatus = if ($user.AccountEnabled) { "Enabled" } else { "Disabled" }
-            
-            # Sign-in details
             LastSignInDateTime = $lastSignIn
             DaysSinceLastSignIn = $daysSinceSignIn
             SignInStatus = $signInStatus
-            
-            # Offboarding details
             OffboardReason = $offboardDetails
             IsOffboardedByDisable = $isDisabled
             IsOffboardedByInactivity = $isInactive
-            
-            # Metadata
             CreatedDate = $user.CreatedDateTime
             Groups = @()
         }
@@ -137,7 +117,8 @@ function Get-GroupAnalysis {
         return @()
     }
     
-    Write-Host "`nAnalyzing $($TargetGroups.Count) groups..." -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Analyzing $($TargetGroups.Count) groups..." -ForegroundColor Cyan
     
     $results = @()
     
@@ -161,7 +142,6 @@ function Get-GroupAnalysis {
             $active = $groupFinanceUsers | Where-Object { $_.IsActive }
             $offboarded = $groupFinanceUsers | Where-Object { -not $_.IsActive }
             
-            # Categorize offboarded by reason
             $disabledInGroup = $offboarded | Where-Object { $_.IsOffboardedByDisable }
             $inactiveInGroup = $offboarded | Where-Object { $_.IsOffboardedByInactivity }
             
@@ -201,7 +181,6 @@ function Export-Results {
     
     New-Item -ItemType Directory -Path $ExportPath -Force | Out-Null
     
-    # All users with full details
     $allPath = Join-Path $ExportPath "All_Finance_Users_Detailed.csv"
     $AllUsers | Select-Object @(
         'DisplayName',
@@ -222,7 +201,6 @@ function Export-Results {
         @{N='GroupMemberships'; E={$_.Groups -join '; '}}
     ) | Export-Csv -Path $allPath -NoTypeInformation
     
-    # Active users summary
     $activePath = Join-Path $ExportPath "Active_Users.csv"
     $AllUsers | Where-Object { $_.IsActive } | Select-Object @(
         'DisplayName',
@@ -235,7 +213,6 @@ function Export-Results {
         @{N='DaysSinceSignIn'; E={$_.DaysSinceLastSignIn}}
     ) | Export-Csv -Path $activePath -NoTypeInformation
     
-    # Offboarded users with reasons
     $offPath = Join-Path $ExportPath "Offboarded_Users_Detailed.csv"
     $AllUsers | Where-Object { -not $_.IsActive } | Select-Object @(
         'DisplayName',
@@ -251,7 +228,6 @@ function Export-Results {
         @{N='GroupMemberships'; E={$_.Groups -join '; '}}
     ) | Export-Csv -Path $offPath -NoTypeInformation
     
-    # Critical: Inactive but not disabled (potential oversight)
     $inactivePath = Join-Path $ExportPath "CRITICAL_Inactive_But_Enabled.csv"
     $AllUsers | Where-Object { $_.IsOffboardedByInactivity -and $_.AccountEnabled } | Select-Object @(
         'DisplayName',
@@ -264,7 +240,6 @@ function Export-Results {
         @{N='Recommendation'; E={"Disable account or verify employment status"}}
     ) | Export-Csv -Path $inactivePath -NoTypeInformation
     
-    # Group analysis
     foreach ($group in $GroupResults) {
         $safeName = $group.GroupName -replace '[\\/:*?"<>|]', '_'
         
@@ -295,7 +270,6 @@ function Export-Results {
         }
     }
     
-    # Security risk: Offboarded users still in groups
     $risks = $AllUsers | Where-Object { -not $_.IsActive -and $_.Groups.Count -gt 0 }
     if ($risks.Count -gt 0) {
         $riskPath = Join-Path $ExportPath "SECURITY_RISK_Offboarded_With_Group_Access.csv"
@@ -312,7 +286,6 @@ function Export-Results {
         ) | Export-Csv -Path $riskPath -NoTypeInformation
     }
     
-    # Summary statistics
     $stats = [PSCustomObject]@{
         ReportDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         Department = $DepartmentName
@@ -330,7 +303,8 @@ function Export-Results {
     $stats | ConvertTo-Json | Out-File -FilePath (Join-Path $ExportPath "Census_Summary.json")
     $stats | Select-Object * | Export-Csv -Path (Join-Path $ExportPath "Census_Summary.csv") -NoTypeInformation
     
-    Write-Host "`nReports saved to: $ExportPath" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Reports saved to: $ExportPath" -ForegroundColor Green
     Write-Host "Files generated:" -ForegroundColor Gray
     Get-ChildItem $ExportPath | Select-Object Name | ForEach-Object { Write-Host "  - $($_.Name)" -ForegroundColor Gray }
 }
@@ -341,55 +315,58 @@ function Show-Dashboard {
         [array]$GroupResults
     )
     
-    Write-Host "`n" + ("=" * 70) -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "======================================================================" -ForegroundColor Cyan
     Write-Host "  FINANCE DEPARTMENT CENSUS DASHBOARD" -ForegroundColor Cyan
-    Write-Host ("=" * 70) -ForegroundColor Cyan
+    Write-Host "======================================================================" -ForegroundColor Cyan
     
-    Write-Host "`n📊 DEPARTMENT OVERVIEW" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "DEPARTMENT OVERVIEW" -ForegroundColor Yellow
     Write-Host "  Department: $DepartmentName" -ForegroundColor White
     Write-Host "  Total Users: $($AllUsers.Count)" -ForegroundColor White
     
     $active = $AllUsers | Where-Object { $_.IsActive }
     $offboarded = $AllUsers | Where-Object { -not $_.IsActive }
     
-    Write-Host "  ├── Active: $($active.Count)" -ForegroundColor Green
-    Write-Host "  └── Offboarded: $($offboarded.Count)" -ForegroundColor Red
+    Write-Host "  Active: $($active.Count)" -ForegroundColor Green
+    Write-Host "  Offboarded: $($offboarded.Count)" -ForegroundColor Red
     
-    Write-Host "`n🔍 OFFBOARDING BREAKDOWN" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "OFFBOARDING BREAKDOWN" -ForegroundColor Yellow
     $byDisable = ($AllUsers | Where-Object { $_.IsOffboardedByDisable }).Count
     $byInactivity = ($AllUsers | Where-Object { $_.IsOffboardedByInactivity }).Count
     $both = ($AllUsers | Where-Object { $_.IsOffboardedByDisable -and $_.IsOffboardedByInactivity }).Count
     
     Write-Host "  Account Disabled: $byDisable" -ForegroundColor Red
-    Write-Host "  Inactive ($InactivityThresholdDays+ days): $byInactivity" -ForegroundColor Red
+    Write-Host "  Inactive $InactivityThresholdDays days or more: $byInactivity" -ForegroundColor Red
     Write-Host "  Both conditions: $both" -ForegroundColor Magenta
     
-    # Critical finding
     $critical = $AllUsers | Where-Object { $_.IsOffboardedByInactivity -and $_.AccountEnabled }
     if ($critical.Count -gt 0) {
-        Write-Host "`n🚨 CRITICAL: Inactive but Enabled Accounts" -ForegroundColor Red
-        Write-Host "   Found $($critical.Count) accounts with no sign-in for $InactivityThresholdDays+ days" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "CRITICAL: Inactive but Enabled Accounts" -ForegroundColor Red
+        Write-Host "   Found $($critical.Count) accounts with no sign-in for $InactivityThresholdDays days or more" -ForegroundColor Red
         Write-Host "   but are still ENABLED. These should be reviewed." -ForegroundColor Yellow
         $critical | Select-Object -First 5 | ForEach-Object {
-            Write-Host "   • $($_.DisplayName) - $($_.DaysSinceLastSignIn) days inactive" -ForegroundColor Gray
+            Write-Host "   - $($_.DisplayName) - $($_.DaysSinceLastSignIn) days inactive" -ForegroundColor Gray
         }
     }
     
     if ($GroupResults.Count -gt 0) {
-        Write-Host "`n👥 GROUP ANALYSIS" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "GROUP ANALYSIS" -ForegroundColor Yellow
         foreach ($group in $GroupResults) {
             Write-Host "  $($group.GroupName):" -ForegroundColor Cyan
             Write-Host "    Total: $($group.Total) | Active: $($group.Active) | Offboarded: $($group.Offboarded)" -ForegroundColor White
             if ($group.Offboarded -gt 0) {
-                Write-Host "    ⚠ Security Risk: $($group.Offboarded) offboarded users have access!" -ForegroundColor Red
+                Write-Host "    WARNING: $($group.Offboarded) offboarded users have access!" -ForegroundColor Red
             }
         }
     }
     
-    Write-Host ("=" * 70) -ForegroundColor Cyan
+    Write-Host "======================================================================" -ForegroundColor Cyan
 }
 
-# Main execution
 Write-Host "Finance Department Census Tool v3.0" -ForegroundColor Cyan
 
 Connect-GraphEnvironment
