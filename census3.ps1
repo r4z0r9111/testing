@@ -1,0 +1,267 @@
+<#
+.SYNOPSIS
+    Finance Department User Census
+.DESCRIPTION
+    Scans Finance department and analyzes specified groups/DLs for active/offboarded users
+.PARAMETER DepartmentName
+    Department to scan (default: Finance)
+.PARAMETER GroupNames
+    Array of group display names to analyze
+.PARAMETER GroupIds
+    Array of group object IDs to analyze
+.PARAMETER ExportPath
+    Path for output files
+.PARAMETER IncludeSignInActivity
+    Include last sign-in data (requires AuditLog.Read.All)
+#>
+
+[CmdletBinding()]
+param(
+    [string]$DepartmentName = "Finance",
+    [string[]]$GroupNames = @(),
+    [string[]]$GroupIds = @(),
+    [string]$ExportPath = ".\FinanceCensus_$(Get-Date -Format 'yyyyMMdd_HHmmss')",
+    [switch]$IncludeSignInActivity
+)
+
+#Requires -Modules Microsoft.Graph.Users, Microsoft.Graph.Groups
+
+function Connect-GraphEnvironment {
+    $scopes = @(
+        "User.Read.All",
+        "GroupMember.Read.All",
+        "Directory.Read.All",
+        "Group.Read.All"
+    )
+    
+    if ($IncludeSignInActivity) {
+        $scopes += "AuditLog.Read.All"
+    }
+    
+    Connect-MgGraph -Scopes $scopes -NoWelcome
+    Write-Host "Connected to Microsoft Graph" -ForegroundColor Green
+}
+
+function Get-FinanceUsers {
+    Write-Host "`nScanning $DepartmentName department..." -ForegroundColor Cyan
+    
+    $properties = @(
+        'Id',
+        'DisplayName',
+        'UserPrincipalName',
+        'Mail',
+        'JobTitle',
+        'Department',
+        'AccountEnabled',
+        'CreatedDateTime',
+        'OfficeLocation'
+    )
+    
+    if ($IncludeSignInActivity) {
+        $properties += 'SignInActivity'
+    }
+    
+    $filter = "department eq '$DepartmentName'"
+    $users = Get-MgUser -Filter $filter -Property $properties -All
+    
+    $results = foreach ($user in $users) {
+        $isActive = $user.AccountEnabled
+        $status = if ($isActive) { "Active" } else { "Offboarded" }
+        
+        $lastSignIn = $null
+        if ($IncludeSignInActivity -and $user.SignInActivity.LastSignInDateTime) {
+            $lastSignIn = [datetime]$user.SignInActivity.LastSignInDateTime
+        }
+        
+        [PSCustomObject]@{
+            Id = $user.Id
+            DisplayName = $user.DisplayName
+            UserPrincipalName = $user.UserPrincipalName
+            Email = $user.Mail
+            JobTitle = $user.JobTitle
+            Status = $status
+            IsActive = $isActive
+            CreatedDate = $user.CreatedDateTime
+            LastSignInDate = $lastSignIn
+            Groups = @()
+        }
+    }
+    
+    Write-Host "Found $($results.Count) users" -ForegroundColor Green
+    return $results
+}
+
+function Resolve-Group {
+    param(
+        [string]$Name
+    )
+    
+    try {
+        $filter = "startswith(DisplayName,'$Name')"
+        $groups = Get-MgGroup -Filter $filter -All
+        
+        $exactMatch = $groups | Where-Object { $_.DisplayName -eq $Name }
+        
+        if ($exactMatch) {
+            return $exactMatch
+        }
+        
+        $partialMatch = $groups | Where-Object { $_.DisplayName -like "*$Name*" }
+        return $partialMatch
+    }
+    catch {
+        Write-Warning "Error finding group '$Name': $_"
+        return $null
+    }
+}
+
+function Get-GroupAnalysis {
+    param(
+        [array]$FinanceUsers,
+        [array]$TargetGroups
+    )
+    
+    if ($TargetGroups.Count -eq 0) {
+        Write-Host "No groups specified for analysis" -ForegroundColor Yellow
+        return @()
+    }
+    
+    Write-Host "`nAnalyzing $($TargetGroups.Count) groups..." -ForegroundColor Cyan
+    
+    $results = @()
+    $financeUserIds = $FinanceUsers.Id
+    
+    foreach ($group in $TargetGroups) {
+        Write-Host "Processing: $($group.DisplayName)" -ForegroundColor Gray
+        
+        try {
+            $members = Get-MgGroupMember -GroupId $group.Id -All
+            
+            $groupFinanceUsers = @()
+            foreach ($member in $members) {
+                if ($member.AdditionalProperties.'@odata.type' -eq '#microsoft.graph.user') {
+                    $match = $FinanceUsers | Where-Object { $_.Id -eq $member.Id }
+                    if ($match) {
+                        $groupFinanceUsers += $match
+                        $match.Groups += $group.DisplayName
+                    }
+                }
+            }
+            
+            $active = $groupFinanceUsers | Where-Object { $_.IsActive }
+            $offboarded = $groupFinanceUsers | Where-Object { -not $_.IsActive }
+            
+            $result = [PSCustomObject]@{
+                GroupId = $group.Id
+                GroupName = $group.DisplayName
+                Total = $groupFinanceUsers.Count
+                Active = $active.Count
+                Offboarded = $offboarded.Count
+                ActiveUsers = $active
+                OffboardedUsers = $offboarded
+            }
+            
+            $results += $result
+            
+            Write-Host "  Total: $($result.Total) | Active: $($result.Active) | Offboarded: $($result.Offboarded)" -ForegroundColor White
+            
+            if ($result.Offboarded -gt 0) {
+                Write-Host "  WARNING: $($result.Offboarded) offboarded users in group!" -ForegroundColor Red
+            }
+        }
+        catch {
+            Write-Warning "Error analyzing group '$($group.DisplayName)': $_"
+        }
+    }
+    
+    return $results
+}
+
+function Export-Results {
+    param(
+        [array]$AllUsers,
+        [array]$GroupResults
+    )
+    
+    New-Item -ItemType Directory -Path $ExportPath -Force | Out-Null
+    
+    # All users
+    $allPath = Join-Path $ExportPath "All_Finance_Users.csv"
+    $AllUsers | Select-Object Id, DisplayName, UserPrincipalName, Email, JobTitle, Status, IsActive, CreatedDate, LastSignInDate, @{N='Groups';E={$_.Groups -join ';'}} | Export-Csv -Path $allPath -NoTypeInformation
+    
+    # Active only
+    $activePath = Join-Path $ExportPath "Active_Users.csv"
+    $AllUsers | Where-Object { $_.IsActive } | Select-Object DisplayName, UserPrincipalName, Email, JobTitle | Export-Csv -Path $activePath -NoTypeInformation
+    
+    # Offboarded only
+    $offPath = Join-Path $ExportPath "Offboarded_Users.csv"
+    $AllUsers | Where-Object { -not $_.IsActive } | Select-Object DisplayName, UserPrincipalName, Email, JobTitle | Export-Csv -Path $offPath -NoTypeInformation
+    
+    # Group details
+    foreach ($group in $GroupResults) {
+        $safeName = $group.GroupName -replace '[\\/:*?"<>|]', '_'
+        
+        if ($group.ActiveUsers.Count -gt 0) {
+            $group.ActiveUsers | Select-Object DisplayName, UserPrincipalName, Email, JobTitle | Export-Csv -Path (Join-Path $ExportPath "$safeName`_Active.csv") -NoTypeInformation
+        }
+        
+        if ($group.OffboardedUsers.Count -gt 0) {
+            $group.OffboardedUsers | Select-Object DisplayName, UserPrincipalName, Email, JobTitle | Export-Csv -Path (Join-Path $ExportPath "$safeName`_Offboarded_RISK.csv") -NoTypeInformation
+        }
+    }
+    
+    # Security report
+    $risks = $AllUsers | Where-Object { -not $_.IsActive -and $_.Groups.Count -gt 0 }
+    if ($risks.Count -gt 0) {
+        $riskPath = Join-Path $ExportPath "SECURITY_RISK_Offboarded_In_Groups.csv"
+        $risks | Select-Object DisplayName, UserPrincipalName, Email, @{N='GroupMemberships';E={$_.Groups -join ';'}} | Export-Csv -Path $riskPath -NoTypeInformation
+    }
+    
+    Write-Host "`nReports saved to: $ExportPath" -ForegroundColor Green
+}
+
+# Main execution
+Write-Host "Finance Department Census Tool" -ForegroundColor Cyan
+
+Connect-GraphEnvironment
+
+# Get all Finance users
+$financeUsers = Get-FinanceUsers
+
+# Resolve groups to analyze
+$targetGroups = @()
+
+foreach ($name in $GroupNames) {
+    $found = Resolve-Group -Name $name
+    if ($found) {
+        $targetGroups += $found
+    }
+}
+
+foreach ($id in $GroupIds) {
+    try {
+        $group = Get-MgGroup -GroupId $id
+        $targetGroups += $group
+    }
+    catch {
+        Write-Warning "Group ID not found: $id"
+    }
+}
+
+# Remove duplicates
+$targetGroups = $targetGroups | Group-Object Id | ForEach-Object { $_.Group[0] }
+
+# Analyze groups
+$analysis = Get-GroupAnalysis -FinanceUsers $financeUsers -TargetGroups $targetGroups
+
+# Export
+Export-Results -AllUsers $financeUsers -GroupResults $analysis
+
+# Summary
+Write-Host "`nCensus Complete" -ForegroundColor Green
+Write-Host "Total Finance Users: $($financeUsers.Count)" -ForegroundColor White
+Write-Host "Active: $(($financeUsers | Where-Object { $_.IsActive }).Count)" -ForegroundColor Green
+Write-Host "Offboarded: $(($financeUsers | Where-Object { -not $_.IsActive }).Count)" -ForegroundColor Red
+Write-Host "Groups Analyzed: $($analysis.Count)" -ForegroundColor White
+
+Disconnect-MgGraph
