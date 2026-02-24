@@ -29,9 +29,7 @@ param(
 function Connect-GraphEnvironment {
     $scopes = @(
         "User.Read.All",
-        "GroupMember.Read.All",
-        "Directory.Read.All",
-        "Group.Read.All"
+        "Directory.Read.All"
     )
     
     if ($IncludeSignInActivity) {
@@ -89,30 +87,6 @@ function Get-FinanceUsers {
     
     Write-Host "Found $($results.Count) users" -ForegroundColor Green
     return $results
-}
-
-function Resolve-Group {
-    param(
-        [string]$Name
-    )
-    
-    try {
-        $filter = "startswith(DisplayName,'$Name')"
-        $groups = Get-MgGroup -Filter $filter -All
-        
-        $exactMatch = $groups | Where-Object { $_.DisplayName -eq $Name }
-        
-        if ($exactMatch) {
-            return $exactMatch
-        }
-        
-        $partialMatch = $groups | Where-Object { $_.DisplayName -like "*$Name*" }
-        return $partialMatch
-    }
-    catch {
-        Write-Warning "Error finding group '$Name': $_"
-        return $null
-    }
 }
 
 function Get-GroupAnalysis {
@@ -185,19 +159,15 @@ function Export-Results {
     
     New-Item -ItemType Directory -Path $ExportPath -Force | Out-Null
     
-    # All users
     $allPath = Join-Path $ExportPath "All_Finance_Users.csv"
     $AllUsers | Select-Object Id, DisplayName, UserPrincipalName, Email, JobTitle, Status, IsActive, CreatedDate, LastSignInDate, @{N='Groups';E={$_.Groups -join ';'}} | Export-Csv -Path $allPath -NoTypeInformation
     
-    # Active only
     $activePath = Join-Path $ExportPath "Active_Users.csv"
     $AllUsers | Where-Object { $_.IsActive } | Select-Object DisplayName, UserPrincipalName, Email, JobTitle | Export-Csv -Path $activePath -NoTypeInformation
     
-    # Offboarded only
     $offPath = Join-Path $ExportPath "Offboarded_Users.csv"
     $AllUsers | Where-Object { -not $_.IsActive } | Select-Object DisplayName, UserPrincipalName, Email, JobTitle | Export-Csv -Path $offPath -NoTypeInformation
     
-    # Group details
     foreach ($group in $GroupResults) {
         $safeName = $group.GroupName -replace '[\\/:*?"<>|]', '_'
         
@@ -210,7 +180,6 @@ function Export-Results {
         }
     }
     
-    # Security report
     $risks = $AllUsers | Where-Object { -not $_.IsActive -and $_.Groups.Count -gt 0 }
     if ($risks.Count -gt 0) {
         $riskPath = Join-Path $ExportPath "SECURITY_RISK_Offboarded_In_Groups.csv"
@@ -220,23 +189,13 @@ function Export-Results {
     Write-Host "`nReports saved to: $ExportPath" -ForegroundColor Green
 }
 
-# Main execution
 Write-Host "Finance Department Census Tool" -ForegroundColor Cyan
 
 Connect-GraphEnvironment
 
-# Get all Finance users
 $financeUsers = Get-FinanceUsers
 
-# Resolve groups to analyze
 $targetGroups = @()
-
-foreach ($name in $GroupNames) {
-    $found = Resolve-Group -Name $name
-    if ($found) {
-        $targetGroups += $found
-    }
-}
 
 foreach ($id in $GroupIds) {
     try {
@@ -244,20 +203,16 @@ foreach ($id in $GroupIds) {
         $targetGroups += $group
     }
     catch {
-        Write-Warning "Group ID not found: $id"
+        Write-Warning "Group ID not found or access denied: $id"
     }
 }
 
-# Remove duplicates
 $targetGroups = $targetGroups | Group-Object Id | ForEach-Object { $_.Group[0] }
 
-# Analyze groups
 $analysis = Get-GroupAnalysis -FinanceUsers $financeUsers -TargetGroups $targetGroups
 
-# Export
 Export-Results -AllUsers $financeUsers -GroupResults $analysis
 
-# Summary
 Write-Host "`nCensus Complete" -ForegroundColor Green
 Write-Host "Total Finance Users: $($financeUsers.Count)" -ForegroundColor White
 Write-Host "Active: $(($financeUsers | Where-Object { $_.IsActive }).Count)" -ForegroundColor Green
