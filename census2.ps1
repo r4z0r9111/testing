@@ -1,27 +1,25 @@
 param(
     [Parameter(Mandatory=$true)][string]$Department,
-    [Parameter(Mandatory=$false)][string]$OutputPath = "C:\temp\dept_$Department.csv"
+    [string]$OutputPath
 )
 
 Connect-MgGraph -Scopes "User.Read.All","AuditLog.Read.All" -NoWarning
-Select-MgProfile beta
 
-$users = Get-MgBetaUser -Filter "department eq '$Department'" -All -Property "displayName","userPrincipalName","department","jobTitle","accountEnabled","createdDateTime","signInActivity"
+$users = Get-MgUser -Filter "department eq '$Department'" -All -Property "id","displayName","userPrincipalName","department","jobTitle","accountEnabled","createdDateTime"
 
-$results = $users | ForEach-Object {
-    $days = if($_.SignInActivity.LastSuccessfulSignInDateTime) { 
-        [math]::Floor(((Get-Date) - $_.SignInActivity.LastSuccessfulSignInDateTime).TotalDays) 
-    } else { $null }
+$results = foreach ($user in $users) {
+    $lastSignIn = (Get-MgAuditLogSignIn -Filter "userId eq '$($user.Id)'" -Top 1).CreatedDateTime
+    $days = if($lastSignIn) { [math]::Floor(((Get-Date) - $lastSignIn).TotalDays) } else { $null }
     
     [PSCustomObject]@{
-        Name = $_.DisplayName
-        UPN = $_.UserPrincipalName
-        JobTitle = $_.JobTitle
-        Enabled = $_.AccountEnabled
-        Created = $_.CreatedDateTime
-        LastSignIn = $_.SignInActivity.LastSuccessfulSignInDateTime
+        Name = $user.DisplayName
+        UPN = $user.UserPrincipalName
+        JobTitle = $user.JobTitle
+        Enabled = $user.AccountEnabled
+        Created = $user.CreatedDateTime
+        LastSignIn = $lastSignIn
         DaysSinceSignIn = $days
-        Status = if(-not $_.AccountEnabled) { "TERMINATED - Disabled" }
+        Status = if(-not $user.AccountEnabled) { "TERMINATED - Disabled" }
                  elseif(-not $days) { "TERMINATED - No Sign-in" }
                  elseif($days -gt 30) { "INACTIVE - $days days" }
                  else { "ACTIVE" }
@@ -37,5 +35,7 @@ $active | Format-Table Name, LastSignIn, DaysSinceSignIn -AutoSize
 Write-Host "`n=== INACTIVE/TERMINATED ($($inactive.Count)) ===" -ForegroundColor Red
 $inactive | Format-Table Name, Status, LastSignIn, DaysSinceSignIn -AutoSize
 
-$results | Export-Csv -Path $OutputPath -NoTypeInformation
-Write-Host "`nExported to: $OutputPath" -ForegroundColor Cyan
+if ($OutputPath) {
+    $results | Export-Csv -Path $OutputPath -NoTypeInformation
+    Write-Host "`nExported to: $OutputPath" -ForegroundColor Cyan
+}
