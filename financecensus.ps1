@@ -29,12 +29,12 @@ function Connect-GraphEnvironment {
     )
     
     Connect-MgGraph -Scopes $scopes -NoWelcome
-    Write-Host "Connected to Microsoft Graph"
+    Write-Host "Connected to Microsoft Graph" -ForegroundColor Green
 }
 
 function Get-FinanceUsers {
-    Write-Host "Scanning $DepartmentName department"
-    Write-Host "Offboarding criteria: Account disabled OR no sign-in for $InactivityThresholdDays days"
+    Write-Host "Scanning $DepartmentName department" -ForegroundColor Cyan
+    Write-Host "Offboarding criteria: Account disabled OR no sign-in for $InactivityThresholdDays days" -ForegroundColor Gray
     
     $properties = @(
         'Id',
@@ -106,8 +106,8 @@ function Get-FinanceUsers {
     $activeCount = ($results | Where-Object { $_.IsActive }).Count
     $offboardedCount = ($results | Where-Object { -not $_.IsActive }).Count
     
-    Write-Host "Found $($results.Count) users"
-    Write-Host "Active: $activeCount | Offboarded: $offboardedCount"
+    Write-Host "Found $($results.Count) users" -ForegroundColor Green
+    Write-Host "Active: $activeCount | Offboarded: $offboardedCount" -ForegroundColor White
     
     return $results
 }
@@ -190,10 +190,10 @@ function Export-Results {
     
     $stats | ConvertTo-Json | Out-File -FilePath (Join-Path $ExportPath "Summary.json")
     
-    Write-Host "Reports saved to: $ExportPath"
+    Write-Host "Reports saved to: $ExportPath" -ForegroundColor Green
 }
 
-Write-Host "Finance Department Census Tool"
+Write-Host "Finance Department Census Tool" -ForegroundColor Cyan
 
 Connect-GraphEnvironment
 
@@ -201,9 +201,9 @@ $financeUsers = Get-FinanceUsers
 
 Export-Results -AllUsers $financeUsers
 
-Write-Host "Census Complete"
-Write-Host "Total Users: $($financeUsers.Count)"
-Write-Host "Active: $(($financeUsers | Where-Object { $_.IsActive }).Count)"
-Write-Host "Offboarded: $(($financeUsers | Where-Object { -not $_.IsActive }).Count)"
+Write-Host "Census Complete" -ForegroundColor Green
+Write-Host "Total Users: $($financeUsers.Count)" -ForegroundColor White
+Write-Host "Active: $(($financeUsers | Where-Object { $_.IsActive }).Count)" -ForegroundColor Green
+Write-Host "Offboarded: $(($financeUsers | Where-Object { -not $_.IsActive }).Count)" -ForegroundColor Red
 
 Disconnect-MgGraph
