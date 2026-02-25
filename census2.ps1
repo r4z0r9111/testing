@@ -1,10 +1,11 @@
 param(
-    [Parameter(Mandatory=$true)]$Department
+    [Parameter(Mandatory=$true)]$Department,
+    [Parameter(Mandatory=$false)]$OutputPath = ".\$Department-Users.csv"
 )
 
 Connect-MgGraph -Scopes User.Read.All,AuditLog.Read.All,Directory.Read.All -NoWelcome | Out-Null
 
-$users = Get-MgUser -Filter "department eq '$Department'" -All -Property mail,displayName,accountEnabled,userPrincipalName
+$users = Get-MgUser -Filter "department eq '$Department'" -All -Property mail,displayName,accountEnabled,userPrincipalName,jobTitle
 
 if($users){
     $results = @()
@@ -14,11 +15,16 @@ if($users){
         $results += [PSCustomObject]@{
             Name = $u.displayName
             Email = $u.mail
+            JobTitle = $u.jobTitle
             Status = if($u.accountEnabled){"Active"}else{"Disabled"}
             LastSignIn = if($lastSignIn){$lastSignIn}else{"Never"}
         }
     }
+    
     $results | Sort-Object Name | Format-Table -AutoSize
+    
+    $results | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+    Write-Host "Exported to: $OutputPath" -ForegroundColor Green
 } else {
     Write-Host "No users found in department: $Department"
 }
