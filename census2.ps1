@@ -4,16 +4,18 @@ param(
 
 Connect-MgGraph -Scopes User.Read.All,AuditLog.Read.All,Directory.Read.All -NoWelcome | Out-Null
 
-$users = Get-MgUser -Filter "department eq '$Department'" -All -Property mail,displayName,accountEnabled,signInActivity
+$users = Get-MgUser -Filter "department eq '$Department'" -All -Property mail,displayName,accountEnabled,userPrincipalName
 
 if($users){
-    $users | ForEach-Object {
-        $lastSignIn = if($_.signInActivity.lastSignInDateTime){$_.signInActivity.lastSignInDateTime}else{"Never"}
+    foreach($u in $users){
+        # Get last sign-in using Get-MgAuditLogSignIn (same as your working script)
+        $lastSignIn = Get-MgAuditLogSignIn -Filter "userPrincipalName eq '$($u.userPrincipalName)'" -Top 1 -Property createdDateTime -ErrorAction SilentlyContinue | Select-Object -ExpandProperty createdDateTime
+        
         [PSCustomObject]@{
-            Name = $_.displayName
-            Email = $_.mail
-            Status = if($_.accountEnabled){"Active"}else{"Disabled"}
-            LastSignIn = $lastSignIn
+            Name = $u.displayName
+            Email = $u.mail
+            Status = if($u.accountEnabled){"Active"}else{"Disabled"}
+            LastSignIn = if($lastSignIn){$lastSignIn}else{"Never"}
         }
     } | Sort-Object Name
 } else {
