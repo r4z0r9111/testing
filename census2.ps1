@@ -1,468 +1,367 @@
 <#
 .SYNOPSIS
-    Search Microsoft Graph for users by department with fallback permission handling.
+    Search Microsoft Graph for users by department and export sign-in and account status information.
 
 .DESCRIPTION
-    Searches for users in a specified department and retrieves account status and profile information.
-    Includes diagnostic mode and fallback options when AuditLog.Read.All permission is unavailable.
+    This script connects to Microsoft Graph, searches for users in a specified department,
+    and retrieves their last sign-in time, account status, name, email, and job title.
+    Requires Microsoft.Graph.Users module and appropriate permissions.
 
 .PARAMETER Department
-    The department name to search for.
+    The department name to search for (supports wildcards with -Like operator).
 
 .PARAMETER OutputPath
-    Optional path to export results to CSV.
+    Optional path to export results to CSV. If not specified, outputs to console.
 
-.PARAMETER UseFallbackMode
-    Switch to skip sign-in activity lookup (works with basic User.Read.All permission only).
+.PARAMETER IncludeAllProperties
+    Switch to include additional properties like created date, office location, etc.
 
-.PARAMETER DiagnosticMode
-    Switch to run permission diagnostics without executing search.
+.PARAMETER UseContains
+    Switch to use 'contains' operator instead of exact match for department search.
 
 .EXAMPLE
-    .\Get-DepartmentUsers.ps1 -Department "IT" -UseFallbackMode
+    .\Get-DepartmentUsers.ps1 -Department "IT"
     
 .EXAMPLE
-    .\Get-DepartmentUsers.ps1 -Department "Sales" -DiagnosticMode
+    .\Get-DepartmentUsers.ps1 -Department "Sales" -OutputPath "C:\Reports\SalesUsers.csv"
+
+.EXAMPLE
+    .\Get-DepartmentUsers.ps1 -Department "HR" -UseContains -IncludeAllProperties -Verbose
 #>
 
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true)]
 param (
-    [Parameter(Mandatory = $true, Position = 0)]
+    [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+    [ValidateNotNullOrEmpty()]
     [string]$Department,
 
     [Parameter(Mandatory = $false)]
+    [ValidatePattern('\.csv$')]
     [string]$OutputPath,
 
     [Parameter(Mandatory = $false)]
-    [switch]$UseFallbackMode,
+    [switch]$IncludeAllProperties,
 
     [Parameter(Mandatory = $false)]
-    [switch]$DiagnosticMode
+    [switch]$UseContains
 )
 
-#Requires -Modules @{ ModuleName="Microsoft.Graph.Users"; ModuleVersion="2.0.0" }
+#Requires -Version 7.2
+#Requires -Modules @{ ModuleName="Microsoft.Graph.Authentication"; ModuleVersion="2.25.0" }
+#Requires -Modules @{ ModuleName="Microsoft.Graph.Users"; ModuleVersion="2.25.0" }
+
+#region Configuration
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'Continue'
+#endregion
 
 #region Functions
 
-function Test-MgGraphPermission {
+function Connect-MgGraphWithCheck {
     <#
-    Checks current permissions and admin consent status.
-    Returns permission status object.
+    .SYNOPSIS
+        Ensures connection to Microsoft Graph with required permissions.
     #>
-    $context = Get-MgContext
-    
-    if (-not $context) {
-        return @{ Connected = $false; Message = "Not connected to Microsoft Graph" }
-    }
+    [CmdletBinding()]
+    param()
 
-    $scopes = $context.Scopes
-    $hasUserRead = $scopes -contains "User.Read.All"
-    $hasAuditLog = $scopes -contains "AuditLog.Read.All"
-    $hasDirectoryRead = $scopes -contains "Directory.Read.All"
-
-    # Test if AuditLog permission actually works (admin consent check)
-    $auditLogWorking = $false
-    if ($hasAuditLog -and -not $UseFallbackMode) {
-        try {
-            # Test query with minimal data
-            $testUser = Get-MgUser -Top 1 -Select "Id,SignInActivity" -ErrorAction Stop
-            if ($testUser.SignInActivity -or $testUser.Id) {
-                $auditLogWorking = $true
-            }
-        }
-        catch {
-            $auditLogWorking = $false
-        }
-    }
-
-    return @{
-        Connected = $true
-        Account = $context.Account
-        TenantId = $context.TenantId
-        HasUserReadAll = $hasUserRead
-        HasAuditLogReadAll = $hasAuditLog
-        HasDirectoryReadAll = $hasDirectoryRead
-        AuditLogFunctional = $auditLogWorking
-        AllScopes = $scopes
-        AuthType = $context.AuthType
-    }
-}
-
-function Connect-MgGraphWithRetry {
-    <#
-    Attempts connection with progressive permission levels.
-    #>
-    param (
-        [switch]$BasicOnly
-    )
-
-    # Disconnect if already connected
-    $existingContext = Get-MgContext
-    if ($existingContext) {
-        Write-Host "Disconnecting existing session..." -ForegroundColor Yellow
-        Disconnect-MgGraph | Out-Null
-        Start-Sleep -Seconds 2
-    }
-
-    if ($BasicOnly) {
-        Write-Host "Connecting with BASIC permissions (User.Read.All only)..." -ForegroundColor Cyan
-        try {
-            Connect-MgGraph -Scopes "User.Read.All" -NoWelcome
-            return $true
-        }
-        catch {
-            Write-Error "Failed to connect with basic permissions: $_"
-            return $false
-        }
-    }
-
-    # Try full permissions first
-    Write-Host "Connecting with FULL permissions..." -ForegroundColor Cyan
-    $fullScopes = @("User.Read.All", "AuditLog.Read.All", "Directory.Read.All")
-    
     try {
-        Connect-MgGraph -Scopes $fullScopes -NoWelcome
-        return $true
-    }
-    catch [System.UnauthorizedAccessException] {
-        Write-Warning "Full permissions denied. Trying basic permissions..."
+        $context = Get-MgContext -ErrorAction SilentlyContinue
         
-        try {
-            Connect-MgGraph -Scopes "User.Read.All" -NoWelcome
-            Write-Host "Connected with BASIC permissions (sign-in data unavailable)" -ForegroundColor Yellow
-            return $true
-        }
-        catch {
-            Write-Error "Failed to connect with any permissions: $_"
-            return $false
-        }
-    }
-    catch {
-        Write-Error "Connection error: $_"
-        return $false
-    }
-}
-
-function Invoke-MgGraphWithFallback {
-    <#
-    Attempts to query users, falls back to basic query if sign-in activity fails.
-    #>
-    param (
-        [string]$Filter,
-        [switch]$SkipSignInActivity
-    )
-
-    $selectBasic = "Id,DisplayName,UserPrincipalName,Mail,JobTitle,Department,AccountEnabled,CreatedDateTime,OfficeLocation"
-    $selectFull = $selectBasic + ",SignInActivity"
-
-    # Try full query first (with SignInActivity)
-    if (-not $SkipSignInActivity) {
-        try {
-            Write-Verbose "Attempting query WITH SignInActivity..."
-            $users = Get-MgUser -Filter $Filter `
-                                -Select $selectFull `
-                                -ConsistencyLevel eventual `
-                                -CountVariable count `
-                                -All `
-                                -ErrorAction Stop
-            return @{
-                Users = $users
-                Count = $count
-                Mode = "Full"
-                Success = $true
-            }
-        }
-        catch [System.Exception] {
-            $errorMsg = $_.Exception.Message
+        if (-not $context) {
+            Write-Verbose "No existing Graph connection found. Initiating authentication..."
             
-            # Check for specific permission errors
-            if ($errorMsg -like "*AllowedRoles*" -or 
-                $errorMsg -like "*privileges*" -or 
-                $errorMsg -like "*unauthorized*" -or
-                $errorMsg -like "*AdminConsentRequired*") {
-                
-                Write-Warning "Full permissions denied. Error: $errorMsg"
-                Write-Host "Falling back to BASIC mode (no sign-in activity)..." -ForegroundColor Yellow
-                
-                # Recursively call with skip flag
-                return Invoke-MgGraphWithFallback -Filter $Filter -SkipSignInActivity
+            # Required scopes for this script (least privilege principle)
+            $requiredScopes = @(
+                'User.Read.All'                    # Read user profiles
+                'AuditLog.Read.All'                # Read sign-in activity (requires admin consent)
+                'Directory.Read.All'               # Read directory data
+            )
+            
+            $connectParams = @{
+                Scopes = $requiredScopes
+                NoWelcome = $true
+                ErrorAction = 'Stop'
             }
-            else {
-                throw
-            }
-        }
-    }
 
-    # Fallback: Basic query without SignInActivity
-    try {
-        Write-Verbose "Executing query WITHOUT SignInActivity..."
-        $users = Get-MgUser -Filter $Filter `
-                            -Select $selectBasic `
-                            -ConsistencyLevel eventual `
-                            -CountVariable count `
-                            -All `
-                            -ErrorAction Stop
-        return @{
-            Users = $users
-            Count = $count
-            Mode = "Basic"
-            Success = $true
+            # Use device code flow in non-interactive environments
+            if ($env:CI -or $env:TF_BUILD -or -not $Host.UI.RawUI) {
+                Write-Verbose "Non-interactive environment detected. Using device code flow."
+                $connectParams['UseDeviceCode'] = $true
+            }
+
+            Connect-MgGraph @connectParams | Out-Null
+            
+            $context = Get-MgContext
+            Write-Host "Connected to Microsoft Graph as: $($context.Account)" -ForegroundColor Green
+            Write-Verbose "Tenant: $($context.TenantId)"
+            Write-Verbose "Scopes: $($context.Scopes -join ', ')"
+        } else {
+            Write-Verbose "Using existing Graph connection: $($context.Account)"
         }
+        
+        # Validate critical permissions
+        $missingScopes = @('AuditLog.Read.All') | Where-Object { $context.Scopes -notcontains $_ }
+        if ($missingScopes) {
+            Write-Warning "Missing critical permissions: $($missingScopes -join ', ')"
+            Write-Warning "Last sign-in dates will not be available. Run: Connect-MgGraph -Scopes 'User.Read.All','AuditLog.Read.All','Directory.Read.All'"
+        }
+
+        return $context
     }
     catch {
-        return @{
-            Users = $null
-            Count = 0
-            Mode = "Failed"
-            Success = $false
-            Error = $_.Exception.Message
+        Write-Error "Failed to connect to Microsoft Graph: $_" -ErrorAction Stop
+    }
+}
+
+function Get-DepartmentUsers {
+    <#
+    .SYNOPSIS
+        Retrieves users from specified department with pagination support.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$DepartmentName,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$UseContainsFilter = $false
+    )
+
+    Write-Verbose "Searching for users in department: $DepartmentName"
+
+    try {
+        # Build filter query using splatting for readability
+        $filterOperator = if ($UseContainsFilter) { 'contains' } else { 'eq' }
+        $filter = "department $filterOperator '$DepartmentName'"
+        
+        Write-Debug "Using OData filter: $filter"
+
+        # Define properties to retrieve (optimize payload)
+        $selectProperties = @(
+            'Id'
+            'DisplayName'
+            'UserPrincipalName'
+            'Mail'
+            'JobTitle'
+            'Department'
+            'AccountEnabled'
+            'SignInActivity'
+            'CreatedDateTime'
+            'OfficeLocation'
+            'City'
+            'Country'
+            'EmployeeType'
+        )
+
+        # Build parameter splat for Get-MgUser
+        $mgUserParams = @{
+            Filter = $filter
+            Select = $selectProperties
+            ConsistencyLevel = 'eventual'
+            CountVariable = 'userCount'
+            All = $true
+            ErrorAction = 'Stop'
+        }
+
+        # Retrieve users with automatic pagination
+        $users = Get-MgUser @mgUserParams
+
+        Write-Host "Found $userCount users in department '$DepartmentName'" -ForegroundColor Green
+        
+        return $users
+    }
+    catch {
+        # Handle specific Graph errors
+        if ($_.Exception.Message -like '*Insufficient privileges*') {
+            Write-Error "Authorization failed. Ensure admin consent is granted for required permissions. Original error: $_" -ErrorAction Stop
+        }
+        elseif ($_.Exception.Message -like '*Bad request*') {
+            Write-Error "Invalid filter syntax. Try using -UseContains for partial matches. Original error: $_" -ErrorAction Stop
+        }
+        else {
+            Write-Error "Failed to retrieve users: $_" -ErrorAction Stop
         }
     }
 }
 
-function Get-DepartmentUsersSafe {
+function Format-UserOutput {
     <#
-    Safely retrieves users with automatic fallback handling.
+    .SYNOPSIS
+        Transforms raw Graph user objects into standardized output format.
     #>
+    [CmdletBinding()]
     param (
-        [string]$DepartmentName,
-        [switch]$ForceBasicMode
-    )
-
-    Write-Host "`nSearching for users in department: $DepartmentName" -ForegroundColor Cyan
-
-    # Sanitize department name for OData filter
-    $safeDept = $DepartmentName -replace "'", "''"
-    $filter = "department eq '$safeDept'"
-
-    # Try query with automatic fallback
-    $result = Invoke-MgGraphWithFallback -Filter $filter -SkipSignInActivity:$ForceBasicMode
-
-    if (-not $result.Success) {
-        throw "Query failed: $($result.Error)"
-    }
-
-    Write-Host "Found $($result.Count) users (Mode: $($result.Mode))" -ForegroundColor $(if ($result.Mode -eq "Full") { "Green" } else { "Yellow" })
-    
-    if ($result.Mode -eq "Basic") {
-        Write-Host "NOTE: Last sign-in data unavailable due to insufficient permissions" -ForegroundColor Yellow
-        Write-Host "To enable sign-in data, an admin must grant 'AuditLog.Read.All' consent at:" -ForegroundColor Yellow
-        Write-Host "https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps/ApplicationsListBlade" -ForegroundColor Cyan
-    }
-
-    return @{
-        Users = $result.Users
-        Mode = $result.Mode
-    }
-}
-
-function Format-UserOutputSafe {
-    <#
-    Formats user data handling both Full and Basic modes.
-    #>
-    param (
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
         [array]$Users,
-        [string]$Mode
+
+        [Parameter(Mandatory = $false)]
+        [switch]$ExtendedProperties
     )
 
-    $results = foreach ($user in $Users) {
-        # Handle sign-in data only if available (Full mode)
-        $lastSignIn = $null
-        $daysSinceSignIn = $null
-        $signInStatus = "N/A - Permission Required"
+    begin {
+        $results = [System.Collections.Generic.List[object]]::new()
+        $today = Get-Date
+    }
 
-        if ($Mode -eq "Full" -and $user.SignInActivity) {
-            $lastSignIn = if ($user.SignInActivity.LastSignInDateTime) {
-                [datetime]$user.SignInActivity.LastSignInDateTime
-            } else { $null }
-
-            if ($lastSignIn) {
-                $daysSinceSignIn = ((Get-Date) - $lastSignIn).Days
-                
-                $signInStatus = if ($daysSinceSignIn -gt 90) {
-                    "Stale (>90 days)"
-                } elseif ($daysSinceSignIn -gt 30) {
-                    "Warning (>30 days)"
-                } else {
-                    "Recent"
+    process {
+        foreach ($user in $Users) {
+            # Extract last sign-in with null safety
+            $lastSignIn = $null
+            $daysSinceSignIn = $null
+            
+            if ($user.SignInActivity?.LastSignInDateTime) {
+                try {
+                    $lastSignIn = [datetime]::Parse($user.SignInActivity.LastSignInDateTime)
+                    $daysSinceSignIn = ($today - $lastSignIn).Days
+                }
+                catch {
+                    Write-Verbose "Failed to parse sign-in date for $($user.UserPrincipalName): $_"
                 }
             }
-            else {
-                $signInStatus = "Never signed in"
-            }
-        }
 
-        [PSCustomObject]@{
-            DisplayName       = $user.DisplayName
-            Email             = $user.Mail
-            UserPrincipalName = $user.UserPrincipalName
-            JobTitle          = $user.JobTitle
-            Department        = $user.Department
-            AccountEnabled    = $user.AccountEnabled
-            AccountStatus     = if ($user.AccountEnabled) { "Active" } else { "Disabled" }
-            LastSignInDate    = if ($lastSignIn) { 
-                $lastSignIn.ToString("yyyy-MM-dd HH:mm:ss") 
-            } else { 
-                "N/A" 
+            # Build output object using ordered hashtable for consistent property ordering
+            $output = [ordered]@{
+                DisplayName       = $user.DisplayName
+                Email             = $user.Mail
+                UserPrincipalName = $user.UserPrincipalName
+                JobTitle          = $user.JobTitle
+                Department        = $user.Department
+                AccountEnabled    = $user.AccountEnabled
+                AccountStatus     = if ($user.AccountEnabled) { 'Active' } else { 'Disabled' }
+                LastSignInDate    = if ($lastSignIn) { 
+                    $lastSignIn.ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
+                } else { 
+                    'Never/N/A' 
+                }
+                DaysSinceSignIn   = $daysSinceSignIn
+                LastSignInStatus  = if (-not $lastSignIn) {
+                    'No sign-in recorded'
+                } elseif ($daysSinceSignIn -gt 90) {
+                    'Stale (>90 days)'
+                } elseif ($daysSinceSignIn -gt 30) {
+                    'Warning (>30 days)'
+                } else {
+                    'Recent'
+                }
             }
-            DaysSinceSignIn   = $daysSinceSignIn
-            LastSignInStatus  = $signInStatus
-            DataMode          = $Mode
-            UserId            = $user.Id
+
+            # Add extended properties if requested
+            if ($ExtendedProperties) {
+                $output['CreatedDate'] = if ($user.CreatedDateTime) { 
+                    ([datetime]::Parse($user.CreatedDateTime)).ToString('yyyy-MM-dd')
+                } else { 
+                    'N/A' 
+                }
+                $output['Office'] = $user.OfficeLocation
+                $output['City'] = $user.City
+                $output['Country'] = $user.Country
+                $output['EmployeeType'] = $user.EmployeeType
+                $output['UserId'] = $user.Id
+            }
+
+            [void]$results.Add([pscustomobject]$output)
         }
     }
 
-    return $results
+    end {
+        return $results
+    }
 }
 
-function Show-DiagnosticReport {
+function Export-Results {
     <#
-    Displays comprehensive permission diagnostics.
+    .SYNOPSIS
+        Exports results to CSV with error handling.
     #>
-    Write-Host "`n=== MICROSOFT GRAPH DIAGNOSTIC REPORT ===" -ForegroundColor Cyan
-    
-    $permStatus = Test-MgGraphPermission
-    
-    if (-not $permStatus.Connected) {
-        Write-Host "Status: NOT CONNECTED" -ForegroundColor Red
-        Write-Host $permStatus.Message
-        return
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param (
+        [Parameter(Mandatory = $true)]
+        [array]$Data,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if ($PSCmdlet.ShouldProcess($Path, 'Export to CSV')) {
+        try {
+            # Ensure directory exists
+            $directory = Split-Path -Parent $Path
+            if ($directory -and -not (Test-Path $directory)) {
+                New-Item -ItemType Directory -Path $directory -Force | Out-Null
+            }
+
+            $Data | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8 -Force
+            Write-Host "Successfully exported $($Data.Count) records to: $Path" -ForegroundColor Green
+        }
+        catch {
+            Write-Error "Failed to export to CSV: $_" -ErrorAction Stop
+        }
     }
-
-    Write-Host "`nConnection Details:" -ForegroundColor Yellow
-    Write-Host "  Account: $($permStatus.Account)"
-    Write-Host "  Tenant: $($permStatus.TenantId)"
-    Write-Host "  Auth Type: $($permStatus.AuthType)"
-
-    Write-Host "`nPermission Status:" -ForegroundColor Yellow
-    Write-Host "  User.Read.All: $(if ($permStatus.HasUserReadAll) { '✓ GRANTED' } else { '✗ MISSING' })" -ForegroundColor $(if ($permStatus.HasUserReadAll) { "Green" } else { "Red" })
-    Write-Host "  AuditLog.Read.All: $(if ($permStatus.HasAuditLogReadAll) { '✓ GRANTED' } else { '✗ MISSING' })" -ForegroundColor $(if ($permStatus.HasAuditLogReadAll) { "Green" } else { "Red" })
-    Write-Host "  Directory.Read.All: $(if ($permStatus.HasDirectoryReadAll) { '✓ GRANTED' } else { '✗ MISSING' })" -ForegroundColor $(if ($permStatus.HasDirectoryReadAll) { "Green" } else { "Red" })
-
-    Write-Host "`nFunctional Tests:" -ForegroundColor Yellow
-    Write-Host "  SignInActivity Query: $(if ($permStatus.AuditLogFunctional) { '✓ WORKING' } else { '✗ BLOCKED' })" -ForegroundColor $(if ($permStatus.AuditLogFunctional) { "Green" } else { "Red" })
-
-    if (-not $permStatus.HasAuditLogReadAll) {
-        Write-Host "`n⚠ RECOMMENDATION: Basic Mode Required" -ForegroundColor Yellow
-        Write-Host "   Run script with -UseFallbackMode parameter" -ForegroundColor White
-    }
-    elseif (-not $permStatus.AuditLogFunctional) {
-        Write-Host "`n⚠ RECOMMENDATION: Admin Consent Required" -ForegroundColor Yellow
-        Write-Host "   An Azure AD admin must grant consent for AuditLog.Read.All" -ForegroundColor White
-        Write-Host "   URL: https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade" -ForegroundColor Cyan
-    }
-    else {
-        Write-Host "`n✓ All permissions functional. Full mode available." -ForegroundColor Green
-    }
-
-    Write-Host "`nAll Granted Scopes:" -ForegroundColor Gray
-    $permStatus.AllScopes | ForEach-Object { Write-Host "  - $_" -ForegroundColor Gray }
 }
 
 #endregion
 
 #region Main Execution
 
-# Diagnostic mode only
-if ($DiagnosticMode) {
-    # Ensure connection exists for diagnostics
-    if (-not (Get-MgContext)) {
-        Connect-MgGraph -Scopes "User.Read" -NoWelcome
-    }
-    Show-DiagnosticReport
-    exit 0
+# Handle pipeline input
+if ($MyInvocation.ExpectingInput) {
+    $Department = $input
 }
 
-# Ensure connection with appropriate permissions
-$permCheck = Test-MgGraphPermission
-
-if (-not $permCheck.Connected -or 
-    -not $permCheck.HasUserReadAll -or 
-    ($UseFallbackMode -and $permCheck.HasAuditLogReadAll)) {
-    
-    # Determine best connection strategy
-    $useBasic = $UseFallbackMode -or (-not $permCheck.HasAuditLogReadAll)
-    
-    if (-not (Connect-MgGraphWithRetry -BasicOnly:$useBasic)) {
-        exit 1
-    }
+# Validate module version (avoid known buggy v2.26)
+$mgGraphModule = Get-Module Microsoft.Graph.Authentication -ListAvailable | Select-Object -First 1
+if ($mgGraphModule.Version -eq [version]'2.26.0') {
+    Write-Warning "Detected Microsoft Graph SDK v2.26.0 which has known critical bugs. Consider updating to v2.26.1 or later."
 }
 
-# Re-check permissions after connection
-$finalPermCheck = Test-MgGraphPermission
-Write-Host "`nConnected as: $($finalPermCheck.Account)" -ForegroundColor Green
+# Connect to Graph
+$graphContext = Connect-MgGraphWithCheck
 
-# Determine execution mode
-$forceBasic = $UseFallbackMode -or (-not $finalPermCheck.AuditLogFunctional)
-
-if ($forceBasic) {
-    Write-Host "Running in BASIC MODE (sign-in data unavailable)" -ForegroundColor Yellow
-}
-
-# Execute search
+# Retrieve and process users
 try {
-    $searchResult = Get-DepartmentUsersSafe -DepartmentName $Department -ForceBasicMode:$forceBasic
+    $rawUsers = Get-DepartmentUsers -DepartmentName $Department -UseContainsFilter $UseContains
     
-    if (-not $searchResult.Users) {
-        Write-Host "No users found in department: $Department" -ForegroundColor Yellow
-        
-        # Suggest fuzzy search
-        Write-Host "`nTip: Try exact department name from Active Directory, or check available departments:" -ForegroundColor Cyan
-        Write-Host "  Get-MgUser -Select Department -All | Where-Object Department | Group-Object Department | Select-Object Name,Count" -ForegroundColor Gray
+    if (-not $rawUsers) {
+        Write-Warning "No users found in department: $Department"
         exit 0
     }
 
-    # Format and display results
-    $formattedResults = Format-UserOutputSafe -Users $searchResult.Users -Mode $searchResult.Mode
+    # Process results using pipeline for memory efficiency
+    $formattedResults = $rawUsers | Format-UserOutput -ExtendedProperties:$IncludeAllProperties
+
+    # Display results
+    Write-Host "`nDepartment User Report" -ForegroundColor Cyan
+    Write-Host ("=" * 100) -ForegroundColor Gray
     
-    Write-Host "`nResults:" -ForegroundColor Cyan
-    Write-Host ("=" * 120) -ForegroundColor Gray
     $formattedResults | Format-Table -AutoSize
 
-    # Summary statistics
-    $total = $formattedResults.Count
-    $disabled = ($formattedResults | Where-Object { -not $_.AccountEnabled }).Count
-    $noSignInData = ($formattedResults | Where-Object { $_.LastSignInStatus -eq "N/A - Permission Required" }).Count
+    # Summary statistics using Measure-Object
+    $stats = $formattedResults | Measure-Object
+    $disabledCount = ($formattedResults | Where-Object AccountEnabled -eq $false).Count
+    $neverSignedInCount = ($formattedResults | Where-Object LastSignInDate -eq 'Never/N/A').Count
+    $staleCount = ($formattedResults | Where-Object LastSignInStatus -eq 'Stale (>90 days)').Count
 
-    Write-Host "`nSummary:" -ForegroundColor Cyan
-    Write-Host "  Total Users: $total"
-    Write-Host "  Disabled Accounts: $disabled" -ForegroundColor $(if ($disabled -gt 0) { "Red" } else { "Green" })
-    
-    if ($searchResult.Mode -eq "Full") {
-        $neverSignedIn = ($formattedResults | Where-Object { $_.LastSignInStatus -eq "Never signed in" }).Count
-        $stale = ($formattedResults | Where-Object { $_.LastSignInStatus -eq "Stale (>90 days)" }).Count
-        Write-Host "  Never Signed In: $neverSignedIn" -ForegroundColor $(if ($neverSignedIn -gt 0) { "Yellow" } else { "Green" })
-        Write-Host "  Stale Accounts (>90 days): $stale" -ForegroundColor $(if ($stale -gt 0) { "Yellow" } else { "Green" })
-    }
-    else {
-        Write-Host "  Sign-in Data: Unavailable (Basic Mode)" -ForegroundColor Yellow
-    }
+    Write-Host "`nSummary Statistics:" -ForegroundColor Cyan
+    Write-Host "  Total Users: $($stats.Count)"
+    Write-Host "  Disabled Accounts: $disabledCount" -ForegroundColor $(if ($disabledCount -gt 0) { 'Red' } else { 'Green' })
+    Write-Host "  Never Signed In: $neverSignedInCount" -ForegroundColor $(if ($neverSignedInCount -gt 0) { 'Yellow' } else { 'Green' })
+    Write-Host "  Stale Accounts (>90 days): $staleCount" -ForegroundColor $(if ($staleCount -gt 0) { 'Yellow' } else { 'Green' })
 
     # Export if requested
     if ($OutputPath) {
-        try {
-            $formattedResults | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-            Write-Host "`nExported to: $OutputPath" -ForegroundColor Green
-        }
-        catch {
-            Write-Error "Export failed: $_"
-        }
+        Export-Results -Data $formattedResults -Path $OutputPath
     }
 
+    # Return results for pipeline use
     return $formattedResults
 }
 catch {
-    Write-Error "Script failed: $_"
-    
-    # Provide specific guidance
-    if ($_.Exception.Message -like "*AllowedRoles*" -or $_.Exception.Message -like "*unauthorized*") {
-        Write-Host "`nTROUBLESHOOTING:" -ForegroundColor Yellow
-        Write-Host "1. Run with diagnostic mode: .\Get-DepartmentUsers.ps1 -Department 'IT' -DiagnosticMode" -ForegroundColor White
-        Write-Host "2. Run with fallback mode: .\Get-DepartmentUsers.ps1 -Department 'IT' -UseFallbackMode" -ForegroundColor White
-        Write-Host "3. Request admin consent for AuditLog.Read.All in Azure Portal" -ForegroundColor White
-    }
-    
-    exit 1
+    Write-Error "Script execution failed: $_" -ErrorAction Stop
+}
+finally {
+    # Cleanup (optional disconnect)
+    Disconnect-MgGraph | Out-Null
 }
 
 #endregion
