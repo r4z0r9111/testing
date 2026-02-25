@@ -1,106 +1,144 @@
 <#
 .SYNOPSIS
-    Search Microsoft Graph for users by department and export sign-in and account status information.
+    Get members from a Distribution List (mail-enabled group) and their sign-in details.
     
 .DESCRIPTION
-    Connects to Microsoft Graph with required permissions, searches for users in a specified department,
-    and retrieves last sign-in time, account status, name, email, and job title.
-    Compatible with Windows PowerShell 5.1.
-
-.PARAMETER Department
-    The department name to search for.
+    Distribution lists are read-only in Microsoft Graph and synchronize from Exchange Online.
+    This script uses Get-MgGroupTransitiveMember to resolve nested memberships.
+    
+.PARAMETER DistributionListName
+    The display name or email address of the distribution list.
 
 .PARAMETER OutputPath
-    Optional path to export results to CSV.
-
-.PARAMETER IncludeAllProperties
-    Switch to include additional properties.
-
-.PARAMETER UseContains
-    Switch to use 'contains' operator instead of exact match.
+    Optional CSV export path.
 #>
 
 [CmdletBinding()]
 param (
     [Parameter(Mandatory = $true, Position = 0)]
     [ValidateNotNullOrEmpty()]
-    [string]$Department,
+    [string]$DistributionListName,
 
     [Parameter(Mandatory = $false)]
-    [string]$OutputPath,
-
-    [Parameter(Mandatory = $false)]
-    [switch]$IncludeAllProperties,
-
-    [Parameter(Mandatory = $false)]
-    [switch]$UseContains
+    [string]$OutputPath
 )
 
 #Requires -Version 5.1
 
 #region Main Script
 
-# Always connect with required permissions (forces consent if needed)
-Connect-MgGraph -Scopes "User.Read.All","AuditLog.Read.All","Directory.Read.All" -NoWelcome | Out-Null
+# Connect with required permissions - Group.Read.All is essential for distribution lists
+Connect-MgGraph -Scopes "Group.Read.All","User.Read.All","AuditLog.Read.All","Directory.Read.All" -NoWelcome | Out-Null
 
 Write-Verbose "Connected to Microsoft Graph"
 
-# Build filter
-$filterOperator = if ($UseContains) { "contains" } else { "eq" }
-$filter = "department $filterOperator '$Department'"
-
-Write-Verbose "Searching with filter: $filter"
-
-# Get users with required properties
+# Find the distribution list
+# Distribution lists: mailEnabled=true, securityEnabled=false, groupTypes=[]
 try {
-    $users = Get-MgUser -Filter $filter `
-                        -Select "Id,DisplayName,UserPrincipalName,Mail,JobTitle,Department,AccountEnabled,SignInActivity,CreatedDateTime,OfficeLocation,City,Country" `
-                        -ConsistencyLevel eventual `
-                        -CountVariable userCount `
-                        -All `
-                        -ErrorAction Stop
-
-    if (-not $users) {
-        Write-Warning "No users found in department: $Department"
+    $dl = Get-MgGroup -Filter "mailEnabled eq true and securityEnabled eq false and startsWith(displayName,'$DistributionListName')" `
+                      -Top 1 `
+                      -Property "Id,DisplayName,Mail,GroupTypes,MailEnabled,SecurityEnabled" `
+                      -ErrorAction Stop
+    
+    if (-not $dl) {
+        # Try exact match on mail property
+        $dl = Get-MgGroup -Filter "mail eq '$DistributionListName'" `
+                          -Top 1 `
+                          -Property "Id,DisplayName,Mail,GroupTypes,MailEnabled,SecurityEnabled" `
+                          -ErrorAction SilentlyContinue
+    }
+    
+    if (-not $dl) {
+        Write-Error "Distribution list '$DistributionListName' not found. Note: Dynamic distribution groups are not accessible via Microsoft Graph."
         Disconnect-MgGraph | Out-Null
         return
     }
 
-    Write-Host "Found $userCount users in department '$Department'" -ForegroundColor Green
+    Write-Host "Found distribution list: $($dl.DisplayName) ($($dl.Mail))" -ForegroundColor Green
 }
 catch {
-    Write-Error "Failed to retrieve users: $_"
+    Write-Error "Failed to find distribution list: $_"
     Disconnect-MgGraph | Out-Null
     return
 }
 
-# Process results
-$today = Get-Date
-$results = foreach ($user in $users) {
+# Get transitive members (resolves nested groups)
+try {
+    Write-Verbose "Retrieving members (including nested groups)..."
     
-    # Handle sign-in activity (PS 5.1 compatible)
+    # Use Get-MgGroupTransitiveMember to expand all nested memberships
+    $members = Get-MgGroupTransitiveMember -GroupId $dl.Id -All -ErrorAction Stop
+    
+    if (-not $members) {
+        Write-Warning "No members found in distribution list."
+        Disconnect-MgGraph | Out-Null
+        return
+    }
+
+    Write-Host "Found $($members.Count) total members (including nested)" -ForegroundColor Green
+}
+catch {
+    Write-Error "Failed to retrieve members. Ensure you have Group.Read.All permission and admin consent. Error: $_"
+    Disconnect-MgGraph | Out-Null
+    return
+}
+
+# Process members - filter to users only and get detailed info
+$today = Get-Date
+$results = @()
+$userCount = 0
+$skippedCount = 0
+
+foreach ($member in $members) {
+    # Check if this is a user (not a group or contact)
+    $memberType = $member.AdditionalProperties['@odata.type']
+    
+    if ($memberType -ne '#microsoft.graph.user') {
+        Write-Verbose "Skipping non-user member: $($member.AdditionalProperties.displayName) (Type: $memberType)"
+        $skippedCount++
+        continue
+    }
+    
+    $userCount++
+    $userId = $member.Id
+    
+    # Get detailed user info including sign-in activity
+    try {
+        $userDetails = Get-MgUser -UserId $userId `
+                                  -Property "DisplayName,UserPrincipalName,Mail,JobTitle,Department,AccountEnabled,SignInActivity,CreatedDateTime,OfficeLocation,City,Country,LastPasswordChangeDateTime" `
+                                  -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-Verbose "Failed to get details for user $userId : $_"
+        continue
+    }
+
+    if (-not $userDetails) { continue }
+
+    # Parse sign-in activity
     $lastSignIn = $null
     $daysSinceSignIn = $null
     
-    if ($user.SignInActivity -and $user.SignInActivity.LastSignInDateTime) {
+    if ($userDetails.SignInActivity -and $userDetails.SignInActivity.LastSignInDateTime) {
         try {
-            $lastSignIn = [datetime]::Parse($user.SignInActivity.LastSignInDateTime)
+            $lastSignIn = [datetime]::Parse($userDetails.SignInActivity.LastSignInDateTime)
             $daysSinceSignIn = ($today - $lastSignIn).Days
         }
         catch {
-            Write-Verbose "Failed to parse sign-in date for $($user.UserPrincipalName)"
+            Write-Verbose "Failed to parse sign-in date for $($userDetails.UserPrincipalName)"
         }
     }
 
     # Build output object
     $output = [PSCustomObject]@{
-        DisplayName       = $user.DisplayName
-        Email             = $user.Mail
-        UserPrincipalName = $user.UserPrincipalName
-        JobTitle          = $user.JobTitle
-        Department        = $user.Department
-        AccountEnabled    = $user.AccountEnabled
-        AccountStatus     = if ($user.AccountEnabled) { "Active" } else { "Disabled" }
+        DisplayName       = $userDetails.DisplayName
+        Email             = $userDetails.Mail
+        UserPrincipalName = $userDetails.UserPrincipalName
+        JobTitle          = $userDetails.JobTitle
+        Department        = $userDetails.Department
+        Office            = $userDetails.OfficeLocation
+        AccountEnabled    = $userDetails.AccountEnabled
+        AccountStatus     = if ($userDetails.AccountEnabled) { "Active" } else { "Disabled" }
         LastSignInDate    = if ($lastSignIn) { $lastSignIn.ToString("yyyy-MM-dd HH:mm:ss") } else { "Never/N/A" }
         DaysSinceSignIn   = $daysSinceSignIn
         LastSignInStatus  = if (-not $lastSignIn) {
@@ -112,44 +150,49 @@ $results = foreach ($user in $users) {
                             } else {
                                 "Recent"
                             }
+        LastPasswordChange = if ($userDetails.LastPasswordChangeDateTime) { 
+                                ([datetime]::Parse($userDetails.LastPasswordChangeDateTime)).ToString("yyyy-MM-dd")
+                             } else { 
+                                "Unknown" 
+                             }
+        UserId            = $userDetails.Id
     }
 
-    # Add extended properties if requested
-    if ($IncludeAllProperties) {
-        $output | Add-Member -NotePropertyName CreatedDate -NotePropertyValue (
-            if ($user.CreatedDateTime) { ([datetime]::Parse($user.CreatedDateTime)).ToString("yyyy-MM-dd") } else { "N/A" }
-        )
-        $output | Add-Member -NotePropertyName Office -NotePropertyValue $user.OfficeLocation
-        $output | Add-Member -NotePropertyName City -NotePropertyValue $user.City
-        $output | Add-Member -NotePropertyName Country -NotePropertyValue $user.Country
-        $output | Add-Member -NotePropertyName UserId -NotePropertyValue $user.Id
-    }
-
-    $output
+    $results += $output
 }
 
 # Display results
-Write-Host "`nDepartment User Report" -ForegroundColor Cyan
+Write-Host "`nDistribution List Member Report: $($dl.DisplayName)" -ForegroundColor Cyan
 Write-Host ("=" * 100) -ForegroundColor Gray
-$results | Format-Table -AutoSize
+Write-Host "Total members: $($members.Count) | Users processed: $userCount | Non-user objects skipped: $skippedCount" -ForegroundColor Gray
 
-# Summary
-$disabled = ($results | Where-Object { $_.AccountEnabled -eq $false }).Count
-$neverSignedIn = ($results | Where-Object { $_.LastSignInDate -eq "Never/N/A" }).Count
-$stale = ($results | Where-Object { $_.LastSignInStatus -eq "Stale (>90 days)" }).Count
+if ($results.Count -gt 0) {
+    $results | Sort-Object DisplayName | Format-Table -AutoSize
+    
+    # Summary statistics
+    $disabled = ($results | Where-Object { $_.AccountEnabled -eq $false }).Count
+    $neverSignedIn = ($results | Where-Object { $_.LastSignInDate -eq "Never/N/A" }).Count
+    $stale = ($results | Where-Object { $_.LastSignInStatus -eq "Stale (>90 days)" }).Count
 
-Write-Host "`nSummary:" -ForegroundColor Cyan
-Write-Host "  Total: $($results.Count) | Disabled: $disabled | Never signed in: $neverSignedIn | Stale (>90d): $stale"
+    Write-Host "`nSummary:" -ForegroundColor Cyan
+    Write-Host "  Total Users: $($results.Count)"
+    Write-Host "  Disabled Accounts: $disabled" -ForegroundColor $(if ($disabled -gt 0) { "Red" } else { "Green" })
+    Write-Host "  Never Signed In: $neverSignedIn" -ForegroundColor $(if ($neverSignedIn -gt 0) { "Yellow" } else { "Green" })
+    Write-Host "  Stale Accounts (>90 days): $stale" -ForegroundColor $(if ($stale -gt 0) { "Yellow" } else { "Green" })
+}
+else {
+    Write-Warning "No user members found to display."
+}
 
 # Export if requested
-if ($OutputPath) {
+if ($OutputPath -and $results.Count -gt 0) {
     try {
         $dir = Split-Path -Parent $OutputPath
         if ($dir -and -not (Test-Path $dir)) {
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
         }
         $results | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8 -Force
-        Write-Host "Exported to: $OutputPath" -ForegroundColor Green
+        Write-Host "`nExported to: $OutputPath" -ForegroundColor Green
     }
     catch {
         Write-Error "Export failed: $_"
