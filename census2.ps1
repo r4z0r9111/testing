@@ -10,8 +10,8 @@ if($users){
     $users | Select-Object displayName,
                           mail,
                           @{N='AccountStatus';E={if($_.accountEnabled){'Active'}else{'Disabled'}}},
-                          @{N='LastSignIn';E={if($_.SignInActivity.LastSignInDateTime){([datetime]$_.SignInActivity.LastSignInDateTime).ToString('yyyy-MM-dd')}else{'Never'}}}
-                          | Sort-Object displayName
+                          @{N='LastSignIn';E={if($_.SignInActivity.LastSignInDateTime){([datetime]$_.SignInActivity.LastSignInDateTime).ToString('yyyy-MM-dd')}else{'Never'}}} |
+             Sort-Object displayName
 } else {
     Write-Host "No users found in department: $Department"
 }
