@@ -2,14 +2,17 @@ Import-Module Microsoft.Graph.Users
 Import-Module Microsoft.Graph.Groups
 Import-Module Microsoft.Graph.Authentication
 
+$sourceUPN = Read-Host "Enter source user UPN"
+$targetUPN = Read-Host "Enter target user UPN"
+
 Connect-MgGraph -Scopes User.Read.All,AuditLog.Read.All,Directory.Read.All -NoWelcome | Out-Null
 
-$groups = Get-MgUserMemberOf -UserId (Get-MgUser -UserId "").Id -All |
+$groups = Get-MgUserMemberOf -UserId (Get-MgUser -UserId $sourceUPN).Id -All |
     Where-Object { $_.AdditionalProperties.'@odata.type' -eq '#microsoft.graph.group' -and 
                    $_.AdditionalProperties.groupTypes -notcontains 'DynamicMembership' } |
     Select-Object Id, @{N='MailEnabled';E={$_.AdditionalProperties.mailEnabled}}
 
-$targetID = (Get-MgUser -UserId "").Id
+$targetID = (Get-MgUser -UserId $targetUPN).Id
 
 Connect-ExchangeOnline -ShowBanner:$false
 
