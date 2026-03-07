@@ -1,23 +1,29 @@
-Connect-MgGraph -Scopes User.Read.All,AuditLog.Read.All,Directory.Read.All -NoWelcome | Out-Null
-$groups = Get-MgUserMemberOf -UserId (Get-MgUser -UserId "").Id -All |
-    Where-Object { $_.AdditionalProperties.'@odata.type' -eq '#microsoft.graph.group' -and 
-                   $_.AdditionalProperties.groupTypes -notcontains 'DynamicMembership'} |
-    Select-Object Id, @{N='MailEnabled';E={$_.AdditionalProperties.mailEnabled}}
+# Compact version with Exchange Online integration
+Connect-MgGraph -Scopes User.Read.All,Group.Read.All -NoWelcome | Out-Null
+$targetId = (Get-MgUser -UserId "target@domain.com").Id
+$sourceId = (Get-MgUser -UserId "source@domain.com").Id
 
-$targetID = (Get-MgUser -UserId "").Id
-
-# Separate groups
-$graphGroups = $groups | Where-Object { -not $_.MailEnabled }
-$mailGroups = $groups | Where-Object { $_.MailEnabled }
-
-# Graph groups
-$graphGroups | ForEach-Object { New-MgGroupMember -GroupId $_.Id -DirectoryObjectId $targetID }
-
-# Mail-enabled groups via Exchange
-if ($mailGroups) {
-    Connect-ExchangeOnline -ShowBanner:$false
-    $mailGroups | ForEach-Object { Add-DistributionGroupMember -Identity $_.Id -Member $targetID -BypassSecurityGroupManagerCheck -Confirm:$false }
-    Disconnect-ExchangeOnline -Confirm:$false | Out-Null
+# Get groups and separate them
+$groups = Get-MgUserMemberOf -UserId $sourceId -All | Where-Object { 
+    $_.AdditionalProperties.'@odata.type' -eq '#microsoft.graph.group' -and 
+    $_.AdditionalProperties.groupTypes -notcontains 'DynamicMembership'
 }
 
+$graphGroups = $groups | Where-Object { $_.AdditionalProperties.mailEnabled -eq $false }
+$mailGroups = $groups | Where-Object { $_.AdditionalProperties.mailEnabled -eq $true }
+
+# Process Graph groups
+$graphGroups | ForEach-Object { 
+    try { New-MgGroupMember -GroupId $_.Id -DirectoryObjectId $targetId } catch { Write-Warning "Graph: $($_.AdditionalProperties.displayName) - $_" }
+}
+
+# Process Exchange groups
+if ($mailGroups) {
+    Connect-ExchangeOnline -ShowBanner:$false
+    $mailGroups | ForEach-Object {
+        try { Add-DistributionGroupMember -Identity $_.AdditionalProperties.mail -Member $targetId -BypassSecurityGroupManagerCheck -Confirm:$false } 
+        catch { Write-Warning "Exchange: $($_.AdditionalProperties.displayName) - $_" }
+    }
+    Disconnect-ExchangeOnline -Confirm:$false | Out-Null
+}
 Disconnect-MgGraph | Out-Null
