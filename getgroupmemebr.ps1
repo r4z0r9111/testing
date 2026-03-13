@@ -1,22 +1,17 @@
-# Get Microsoft Graph group members - outputs CSV to console (redirect to save)
+# Get group members with Directory.Read.All (no GroupMember.Read.All)
 # Usage: .\Get-GroupMembers.ps1 -GroupName "GroupName" > members.csv
 
 param([Parameter(Mandatory=$true)]$GroupName)
 
-# Connect (read-only scopes)
-Connect-MgGraph -Scopes "GroupMember.Read.All","User.Read.All" -NoWelcome
+Connect-MgGraph -Scopes "Directory.Read.All" -NoWelcome
 
-# Get group and members
 $group = Get-MgGroup -Filter "displayName eq '$GroupName'"
-if (-not $group) { Write-Error "Group not found"; exit 1 }
+if (-not $group) { throw "Group not found" }
 
-# Output CSV header
 "DisplayName,Mail"
-
-# Get members and output CSV rows
 Get-MgGroupMember -GroupId $group.Id -All | 
-    Where-Object { $_.'@odata.type' -eq '#microsoft.graph.user' } |
-    ForEach-Object { 
-        $user = Get-MgUser -UserId $_.Id -Property DisplayName,Mail
-        "`"{0}`",`"{1}`"" -f $user.DisplayName, $user.Mail 
-    }
+   Where-Object { $_.'@odata.type' -match 'user' } |
+   ForEach-Object { 
+       $u = Get-MgUser -UserId $_.Id -Property DisplayName,Mail
+       "`"{0}`",`"{1}`"" -f $u.DisplayName, $u.Mail 
+   }
