@@ -1,0 +1,1 @@
+Get-MgGroup -Top 1 | ForEach-Object { $g=$_; Write-Host "`nGroup: $($g.DisplayName)" -ForegroundColor Green; Get-MgGroupMember -GroupId $g.Id | Select-Object -ExpandProperty AdditionalProperties | Select-Object displayName,mail }
