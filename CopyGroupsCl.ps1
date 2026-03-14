@@ -2,20 +2,40 @@ Import-Module Microsoft.Graph.Users
 Import-Module Microsoft.Graph.Groups
 Import-Module Microsoft.Graph.Authentication
 
+# ── Check / install required modules ──────────────────────────────────────────
+$requiredModules = @(
+    "Microsoft.Graph.Users",
+    "Microsoft.Graph.Groups", 
+    "Microsoft.Graph.Authentication",
+    "ExchangeOnlineManagement"
+)
+
+foreach ($module in $requiredModules) {
+    if (-not (Get-Module -ListAvailable -Name $module)) {
+        Write-Host "Installing $module..." -ForegroundColor Cyan
+        Install-Module $module -Scope CurrentUser -Force -AllowClobber
+    }
+    Import-Module $module -ErrorAction Stop
+}
+
 # ── Collect inputs before connecting ──────────────────────────────────────────
 $sourceUPN = Read-Host "Enter source user UPN"
 $targetUPN = Read-Host "Enter target user UPN"
 
-# ── Connect to Microsoft Graph ─────────────────────────────────────────────────
+# ── Connect ────────────────────────────────────────────────────────────────────
 Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
 Connect-MgGraph -Scopes "User.Read.All","AuditLog.Read.All","Directory.Read.All" -NoWelcome | Out-Null
 
-# ── Resolve both users up front — fail early if either UPN is wrong ────────────
+Write-Host "Connecting to Exchange Online..." -ForegroundColor Cyan
+Connect-ExchangeOnline -ShowBanner:$false
+
+# ── Resolve both users up front ────────────────────────────────────────────────
 try {
     $sourceUser = Get-MgUser -UserId $sourceUPN -ErrorAction Stop
     $targetUser = Get-MgUser -UserId $targetUPN -ErrorAction Stop
 } catch {
     Write-Host "Could not resolve one or both UPNs: $_" -ForegroundColor Red
+    Disconnect-ExchangeOnline -Confirm:$false | Out-Null
     Disconnect-MgGraph | Out-Null
     exit 1
 }
@@ -29,8 +49,7 @@ Write-Host "`nFetching group memberships..." -ForegroundColor Cyan
 $groups = Get-MgUserMemberOf -UserId $sourceUser.Id -All |
     Where-Object {
         $_.AdditionalProperties.'@odata.type' -eq '#microsoft.graph.group' -and
-        $_.AdditionalProperties.groupTypes -notcontains 'DynamicMembership' -and
-        $_.AdditionalProperties.membershipRule -eq $null
+        $_.AdditionalProperties.groupTypes -notcontains 'DynamicMembership'
     } |
     ForEach-Object {
         [PSCustomObject]@{
@@ -42,11 +61,7 @@ $groups = Get-MgUserMemberOf -UserId $sourceUser.Id -All |
 
 Write-Host "Found $($groups.Count) eligible group(s).`n" -ForegroundColor Cyan
 
-# ── Connect to Exchange Online for mail-enabled groups ─────────────────────────
-Write-Host "Connecting to Exchange Online..." -ForegroundColor Cyan
-Connect-ExchangeOnline -ShowBanner:$false
-
-# ── Tracking counters ──────────────────────────────────────────────────────────
+# ── Copy memberships to target ─────────────────────────────────────────────────
 $successCount = 0
 $skipCount    = 0
 $failCount    = 0
@@ -55,21 +70,23 @@ $groups | ForEach-Object {
     $group = $_
 
     if ($group.MailEnabled) {
+        # Mail-enabled: must go through Exchange
         try {
-            Add-DistributionGroupMember -Identity $group.Id -Member $targetUser.Id `
+            Add-DistributionGroupMember -Identity $group.Id -Member $targetUser.UserPrincipalName `
                 -BypassSecurityGroupManagerCheck -Confirm:$false -ErrorAction Stop
-            Write-Host "  [EXO]  Added  : $($group.DisplayName)" -ForegroundColor Green
+            Write-Host "  [EXO]   Added  : $($group.DisplayName)" -ForegroundColor Green
             $successCount++
         } catch {
             if ($_.Exception.Message -match "groupMailbox|already a member|already exist") {
-                Write-Host "  [EXO]  Skipped: $($group.DisplayName) (already a member or unsupported type)" -ForegroundColor Yellow
+                Write-Host "  [EXO]   Skipped: $($group.DisplayName) (already a member or unsupported type)" -ForegroundColor Yellow
                 $skipCount++
             } else {
-                Write-Host "  [EXO]  Failed : $($group.DisplayName) — $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "  [EXO]   Failed : $($group.DisplayName) — $($_.Exception.Message)" -ForegroundColor Red
                 $failCount++
             }
         }
     } else {
+        # Non-mail-enabled security group: use Graph
         try {
             New-MgGroupMember -GroupId $group.Id -DirectoryObjectId $targetUser.Id -ErrorAction Stop
             Write-Host "  [Graph] Added  : $($group.DisplayName)" -ForegroundColor Green
