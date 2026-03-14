@@ -7,9 +7,8 @@ $sourceUPN = Read-Host "Enter source user UPN"
 $targetUPN = Read-Host "Enter target user UPN"
 
 # ── Connect to Microsoft Graph ─────────────────────────────────────────────────
-# Added Group.ReadWrite.All to actually write new members via MgGroupMember
 Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
-Connect-MgGraph -Scopes "User.Read.All","AuditLog.Read.All","Directory.Read.All","Group.ReadWrite.All","GroupMember.ReadWrite.All" -NoWelcome | Out-Null
+Connect-MgGraph -Scopes "User.Read.All","AuditLog.Read.All","Directory.Read.All" -NoWelcome | Out-Null
 
 # ── Resolve both users up front — fail early if either UPN is wrong ────────────
 try {
@@ -30,13 +29,13 @@ Write-Host "`nFetching group memberships..." -ForegroundColor Cyan
 $groups = Get-MgUserMemberOf -UserId $sourceUser.Id -All |
     Where-Object {
         $_.AdditionalProperties.'@odata.type' -eq '#microsoft.graph.group' -and
-        $_.AdditionalProperties.groupTypes -notcontains 'DynamicMembership' -and   # can't manually add to dynamic groups
-        $_.AdditionalProperties.membershipRule -eq $null                            # extra guard for dynamic groups
+        $_.AdditionalProperties.groupTypes -notcontains 'DynamicMembership' -and
+        $_.AdditionalProperties.membershipRule -eq $null
     } |
     ForEach-Object {
         [PSCustomObject]@{
             Id          = $_.Id
-            DisplayName = $_.AdditionalProperties.displayName   # captured for logging
+            DisplayName = $_.AdditionalProperties.displayName
             MailEnabled = $_.AdditionalProperties.mailEnabled
         }
     }
@@ -53,17 +52,15 @@ $skipCount    = 0
 $failCount    = 0
 
 $groups | ForEach-Object {
-    $group = $_   # avoids $_ being overwritten inside catch blocks
+    $group = $_
 
     if ($group.MailEnabled) {
-        # Mail-enabled: use Exchange cmdlet (covers DLs, mail-enabled security groups, M365 groups)
         try {
             Add-DistributionGroupMember -Identity $group.Id -Member $targetUser.Id `
                 -BypassSecurityGroupManagerCheck -Confirm:$false -ErrorAction Stop
             Write-Host "  [EXO]  Added  : $($group.DisplayName)" -ForegroundColor Green
             $successCount++
         } catch {
-            # Suppress noisy non-errors: unified group mailboxes and duplicate membership
             if ($_.Exception.Message -match "groupMailbox|already a member|already exist") {
                 Write-Host "  [EXO]  Skipped: $($group.DisplayName) (already a member or unsupported type)" -ForegroundColor Yellow
                 $skipCount++
@@ -73,7 +70,6 @@ $groups | ForEach-Object {
             }
         }
     } else {
-        # Security group (non-mail-enabled): use Graph
         try {
             New-MgGroupMember -GroupId $group.Id -DirectoryObjectId $targetUser.Id -ErrorAction Stop
             Write-Host "  [Graph] Added  : $($group.DisplayName)" -ForegroundColor Green
